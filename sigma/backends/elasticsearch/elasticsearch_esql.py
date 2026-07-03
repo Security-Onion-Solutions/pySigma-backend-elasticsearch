@@ -4,7 +4,6 @@ from sigma.rule import SigmaRule, SigmaRuleTag
 from sigma.conversion.base import TextQueryBackend
 from sigma.conditions import ConditionItem, ConditionAND, ConditionOR, ConditionNOT
 from sigma.types import SigmaCompareExpression
-from sigma.data.mitre_attack import mitre_attack_tactics, mitre_attack_techniques
 import sigma
 import re
 import json
@@ -188,14 +187,20 @@ class ESQLBackend(TextQueryBackend):
     # correlation_search_field_normalization_expression_joiner: ClassVar[str] = ""
 
     event_count_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats event_count=count(){groupby}"
+        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats event_count=count(){fields}{groupby}"
     }
     value_count_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats value_count=count_distinct({field}){groupby}"
+        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats value_count=count_distinct({field}){fields}{groupby}"
     }
     temporal_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats event_type_count=count_distinct(event_type){groupby}"
+        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats event_type_count=count_distinct(event_type){fields}{groupby}"
     }
+
+    correlation_fields_expression: ClassVar[Dict[str, str]] = {"stats": "{fields}"}
+    correlation_fields_field_expression: ClassVar[Dict[str, str]] = {
+        "stats": ", {field}=values({field})"
+    }
+    correlation_fields_field_expression_joiner: ClassVar[Dict[str, str]] = {"stats": ""}
 
     timespan_mapping: ClassVar[Dict[str, str]] = {
         "s": "seconds",
@@ -223,6 +228,37 @@ class ESQLBackend(TextQueryBackend):
     temporal_condition_expression: ClassVar[Dict[str, str]] = {
         "stats": "| where event_type_count {op} {count}"
     }
+
+    def convert_correlation_aggregation_fields_from_template(
+        self,
+        correlation_rule_fields: list[str],
+        referenced_rules: list,
+        group_by: Optional[list[str]],
+        method: str,
+    ) -> str:
+        if self.correlation_fields_expression is None:
+            return ""
+        all_fields = []
+        for rl in referenced_rules:
+            for fld in rl.rule.fields:
+                if (group_by is None or fld not in group_by) and fld not in all_fields:
+                    all_fields.append(fld)
+        if (
+            len(all_fields) == 0
+            or self.correlation_fields_field_expression is None
+            or self.correlation_fields_field_expression_joiner is None
+        ):
+            return ""
+        return self.correlation_fields_expression[method].format(
+            fields=self.correlation_fields_field_expression_joiner[method].join(
+                (
+                    self.correlation_fields_field_expression[method].format(
+                        field=self.escape_and_quote_field(field)
+                    )
+                    for field in all_fields
+                )
+            )
+        )
 
     def __init__(
         self,
@@ -370,6 +406,8 @@ class ESQLBackend(TextQueryBackend):
         return list(queries)
 
     def finalize_output_threat_model(self, tags: List[SigmaRuleTag]) -> Iterable[Dict]:
+        from sigma.data.mitre_attack import mitre_attack_tactics, mitre_attack_techniques
+        
         attack_tags = [t for t in tags if t.namespace == "attack"]
         if not len(attack_tags) >= 2:
             return []
