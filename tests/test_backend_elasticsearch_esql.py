@@ -683,7 +683,7 @@ detection:
 tags:
     - attack.execution
     - attack.t1059.001
-    - attack.defense_evasion
+    - attack.stealth
     - attack.t1027
         """
     )
@@ -694,7 +694,7 @@ tags:
         "tags": [
             "attack-execution",
             "attack-t1059.001",
-            "attack-defense_evasion",
+            "attack-stealth",
             "attack-t1027",
         ],
         "interval": "5m",
@@ -740,7 +740,7 @@ tags:
                 "tactic": {
                     "id": "TA0005",
                     "reference": "https://attack.mitre.org/tactics/TA0005",
-                    "name": "Defense Evasion",
+                    "name": "Stealth",
                 },
                 "framework": "MITRE ATT&CK",
                 "technique": [
