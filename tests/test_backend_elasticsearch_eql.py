@@ -549,21 +549,16 @@ def test_elasticsearch_eqlapi(eql_backend: EqlBackend):
                 condition: sel
         """
     )
-    result = eql_backend.convert(rule, output_format="eqlapi")
     assert eql_backend.convert(rule, output_format="eqlapi") == [
-        """
-        GET /logs-*/_eql/search
-            {
-                "query": \"\"\"
-                    any where fieldA:"valueA" and fieldB:"valueB"
-                \"\"\"
-            }
-        """
+        r"""GET /logs-*/_eql/search
+{
+    "query": "any where fieldA:\"valueA\" and fieldB:\"valueB\""
+}"""
     ]
 
 
 def test_eql_keyword_quotes_eqlapi(eql_backend: EqlBackend):
-    """Test for NDJSON output with embedded query string query."""
+    """Test for EQL API output with keyword quotes."""
     rule = SigmaCollection.from_yaml(
         """
             title: Test
@@ -583,16 +578,11 @@ def test_eql_keyword_quotes_eqlapi(eql_backend: EqlBackend):
                 condition: sel and keywords
         """
     )
-    result = eql_backend.convert(rule, output_format="eqlapi")
     assert eql_backend.convert(rule, output_format="eqlapi") == [
-        """
-        GET /logs-*/_eql/search
-            {
-                "query": \"\"\"
-                    any where (Field like~ (1234, 5678)) and ("keywordA" or "keywordB")
-                \"\"\"
-            }
-        """
+        r"""GET /logs-*/_eql/search
+{
+    "query": "any where (Field like~ (1234, 5678)) and (\"keywordA\" or \"keywordB\")"
+}"""
     ]
 
 
