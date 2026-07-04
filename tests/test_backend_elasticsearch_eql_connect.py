@@ -289,7 +289,7 @@ class TestConnectElasticsearch:
             verify=False,
             auth=pytest.es_creds,
         )
-        assert result.status_code == 200
+        assert result.status_code == 200, f"Expected status code 200, got {result.status_code}. Response: {result.text}"
         rjson = result.json()
         assert "hits" in rjson
         assert "total" in rjson["hits"]

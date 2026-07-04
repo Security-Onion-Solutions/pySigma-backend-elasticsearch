@@ -669,22 +669,22 @@ def test_elasticsearch_esql_siemrule_ndjson_with_threat(esql_backend: ESQLBacken
     """Test for NDJSON output with embedded query string query."""
     rule = SigmaCollection.from_yaml(
         """
-            title: Test
-            id: c277adc0-f0c4-42e1-af9d-fab062992156
-            status: test
-            logsource:
-                category: test_category
-                product: test_product
-            detection:
-                sel:
-                    fieldA: valueA
-                    fieldB: valueB
-                condition: sel
-            tags:
-                - attack.execution
-                - attack.t1059.001
-                - attack.stealth
-                - attack.t1027
+title: Test
+id: c277adc0-f0c4-42e1-af9d-fab062992156
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    sel:
+        fieldA: valueA
+        fieldB: valueB
+    condition: sel
+tags:
+    - attack.execution
+    - attack.t1059.001
+    - attack.stealth
+    - attack.t1027
         """
     )
     result = esql_backend.convert(rule, output_format="siem_rule_ndjson")
