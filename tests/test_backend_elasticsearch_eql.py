@@ -550,10 +550,9 @@ def test_elasticsearch_eqlapi(eql_backend: EqlBackend):
         """
     )
     assert eql_backend.convert(rule, output_format="eqlapi") == [
-        r"""GET /logs-*/_eql/search
-{
-    "query": "any where fieldA:\"valueA\" and fieldB:\"valueB\""
-}"""
+        {
+            "query": "any where fieldA:\"valueA\" and fieldB:\"valueB\""
+        }
     ]
 
 
@@ -579,10 +578,9 @@ def test_eql_keyword_quotes_eqlapi(eql_backend: EqlBackend):
         """
     )
     assert eql_backend.convert(rule, output_format="eqlapi") == [
-        r"""GET /logs-*/_eql/search
-{
-    "query": "any where (Field like~ (1234, 5678)) and (\"keywordA\" or \"keywordB\")"
-}"""
+        {
+            "query": "any where (Field like~ (1234, 5678)) and (\"keywordA\" or \"keywordB\")"
+        }
     ]
 
 

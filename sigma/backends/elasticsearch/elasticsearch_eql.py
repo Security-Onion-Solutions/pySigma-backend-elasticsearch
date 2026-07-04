@@ -373,16 +373,20 @@ class EqlBackend(TextQueryBackend):
 
     def finalize_query_eqlapi(
         self, rule: SigmaRule, query: str, index: int, state: ConversionState
-    ) -> str:
+    ) -> Dict:
         """
         Create EQL Queries ready to be used against the '/{index_pattern}_eql/search' API Endpoint.
         Reference: https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-eql-search
         """
-        query_body = {
-            "query": f"any where {query}"
-        }
-        json_str = json.dumps(query_body, indent=4)
-        return f"GET /logs-*/_eql/search\n{json_str}"
+        if isinstance(rule, SigmaCorrelationRule):
+            query_body = {
+                "query": f"{query}"
+            }
+        else:
+            query_body = {
+                "query": f"any where {query}"
+            }
+        return query_body
 
     def finalize_output_threat_model(self, tags: List[SigmaRuleTag]) -> Iterable[Dict]:
         from sigma.data.mitre_attack import mitre_attack_tactics, mitre_attack_techniques
