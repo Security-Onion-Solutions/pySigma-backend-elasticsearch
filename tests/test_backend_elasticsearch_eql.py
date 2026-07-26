@@ -234,7 +234,7 @@ def test_eql_regex_query(eql_backend: EqlBackend):
 
 def test_eql_regex_query_escaped_input(eql_backend: EqlBackend):
     rule = SigmaCollection.from_yaml(
-        """
+        r"""
             title: Test
             status: test
             logsource:
@@ -249,7 +249,7 @@ def test_eql_regex_query_escaped_input(eql_backend: EqlBackend):
         """
     )
     assert eql_backend.convert(rule) == [
-        'any where fieldA regex~ "127\.0\.0\.1:[1-9]\d{3}" and fieldB:"foo" and fieldC regex~ "foo\\/bar"'
+        r'any where fieldA regex~ "127\\.0\\.0\\.1:[1-9]\\d{3}" and fieldB:"foo" and fieldC regex~ "foo\/bar"'
     ]
 
 
