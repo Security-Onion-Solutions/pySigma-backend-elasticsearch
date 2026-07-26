@@ -253,6 +253,26 @@ def test_eql_regex_query_escaped_input(eql_backend: EqlBackend):
     ]
 
 
+def test_eql_regex_escaped_dollar_sign(eql_backend: EqlBackend):
+    """Test that regex patterns with escaped special characters like $ are properly escaped for JSON."""
+    rule = SigmaCollection.from_yaml(
+        r"""
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    username|re: \$
+                condition: sel
+        """
+    )
+    assert eql_backend.convert(rule) == [
+        r'any where username regex~ "\\$"'
+    ]
+
+
 def test_eql_cidr_query(eql_backend: EqlBackend):
     rule = SigmaCollection.from_yaml(
         """
