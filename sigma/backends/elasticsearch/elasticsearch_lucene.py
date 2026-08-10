@@ -12,8 +12,9 @@ from sigma.conditions import (
     ConditionOR,
     ConditionNOT,
     ConditionFieldEqualsValueExpression,
+    ConditionValueExpression,
 )
-from sigma.types import SigmaCompareExpression, SigmaNull, SigmaFieldReference
+from sigma.types import SigmaCompareExpression, SigmaNull, SigmaFieldReference, SigmaString
 from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
 import sigma
 
@@ -253,6 +254,32 @@ class LuceneBackend(TextQueryBackend):
             return False
 
         return super().compare_precedence(outer, inner)
+
+    def convert_value_str(self, s: SigmaString, state: ConversionState) -> str:
+        # Phrase-quote multi-word plain values so the query_string parser treats
+        # them as phrase queries rather than splitting on whitespace.
+        if not s.contains_special() and " " in str(s):
+            converted = s.convert(
+                self.escape_char,
+                self.wildcard_multi,
+                self.wildcard_single,
+                self.str_quote + self.add_escaped.replace(" ", ""),
+                self.filter_chars,
+            )
+            return self.str_quote + converted + self.str_quote
+        return super().convert_value_str(s, state)
+
+    def convert_condition_val_str(
+        self, cond: ConditionValueExpression, state: ConversionState
+    ) -> Union[str, DeferredQueryExpression]:
+        # Unbound keyword searches wrap the value in wildcards (*{value}*).
+        # Phrase-quoting would produce *"..."* which is invalid Lucene syntax,
+        # so use TextQueryBackend's convert_value_str (space-escaping, no phrase quote).
+        converted = TextQueryBackend.convert_value_str(self, cond.value, state)
+        return self.unbound_value_str_expression.format(
+            value=converted,
+            regex=self.convert_value_re(cond.value.to_regex(self.add_escaped_re), state),
+        )
 
     def finalize_output_threat_model(self, tags: List[SigmaRuleTag]) -> Iterable[Dict]:
         from sigma.data.mitre_attack import mitre_attack_tactics, mitre_attack_techniques
