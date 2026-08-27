@@ -442,3 +442,46 @@ correlation:
 | eval timebucket=date_trunc(5minutes, @timestamp) | stats event_type_count=count_distinct(event_type), fieldD=values(fieldD) by timebucket, fieldC
 | where event_type_count >= 2"""
     ]
+
+
+MV_CORRELATION_RULE = """
+title: Failed logins
+name: failed_login
+status: test
+logsource:
+    category: test_category
+detection:
+    sel:
+        fieldA: value1
+    condition: sel
+---
+title: Many failed logins
+status: test
+correlation:
+    type: event_count
+    rules:
+        - failed_login
+    group-by:
+        - fieldB
+    timespan: 5m
+    condition:
+        gte: 3
+"""
+
+
+def test_esql_correlation_multivalue_field_in_base_rule():
+    # The MV rewrite has to reach the correlation's embedded WHERE clause too.
+    pipeline = ProcessingPipeline.from_yaml(
+        """
+name: mv
+priority: 10
+transformations:
+  - id: mv
+    type: set_state
+    key: multivalue_fields
+    val: [fieldA]
+"""
+    )
+    query = ESQLBackend(pipeline).convert(SigmaCollection.from_yaml(MV_CORRELATION_RULE))[0]
+    assert 'mv_intersects(fieldA, ["value1"])' in query
+    assert 'fieldA=="value1"' not in query

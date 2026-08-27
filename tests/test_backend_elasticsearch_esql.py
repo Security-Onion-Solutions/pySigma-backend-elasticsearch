@@ -184,7 +184,9 @@ def test_elasticsearch_esql_regex_query(esql_backend: ESQLBackend):
             )
         )
         == [
-            'from * metadata _id, _index, _version | where fieldA rlike "foo.*bar" and fieldB=="foo"'
+            # Sigma |re is PCRE (unanchored); ES|QL RLIKE is Lucene regexp and must match
+            # the whole value, so an unanchored pattern is wrapped.
+            'from * metadata _id, _index, _version | where fieldA rlike ".*foo.*bar.*" and fieldB=="foo"'
         ]
     )
 

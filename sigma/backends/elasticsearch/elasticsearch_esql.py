@@ -3,10 +3,11 @@ from sigma.conversion.state import ConversionState
 from sigma.rule import SigmaRule, SigmaRuleTag
 from sigma.conversion.base import TextQueryBackend
 from sigma.conditions import ConditionItem, ConditionAND, ConditionOR, ConditionNOT
-from sigma.types import SigmaCompareExpression
+from sigma.types import SigmaCompareExpression, SigmaString, SpecialChars, SigmaRegularExpression
 import sigma
 import re
 import json
+import fnmatch
 from typing import ClassVar, Dict, Tuple, Pattern, List, Iterable, Optional, Union
 
 
@@ -268,11 +269,18 @@ class ESQLBackend(TextQueryBackend):
         collect_errors: bool = False,
         schedule_interval: int = 5,
         schedule_interval_unit: str = "m",
+        multivalue_fields: Optional[Iterable[str]] = None,
+        case_insensitive: bool = False,
         **kwargs,
     ):
         super().__init__(processing_pipeline, collect_errors, **kwargs)
         self.schedule_interval = schedule_interval
         self.schedule_interval_unit = schedule_interval_unit
+        # Fields known to hold several values per document.  Unioned with the
+        # pipeline state key of the same name; entries may be globs.
+        self.multivalue_fields = list(multivalue_fields or [])
+        self.case_insensitive = case_insensitive
+        self._mv_unsupported = []
         self.severity_risk_mapping = {
             "INFORMATIONAL": 1,
             "LOW": 21,
@@ -337,6 +345,266 @@ class ESQLBackend(TextQueryBackend):
         
         return query
     
+    # LIKE applies two escape layers (string literal, then the LIKE pattern itself);
+    # the inherited conversion applies only the first. Wrong for LIKE, and in a
+    # negated filter it inverts the meaning. Built from SigmaString parts so each
+    # layer is applied once.
+
+    like_wildcard_multi: ClassVar[str] = "*"
+    like_wildcard_single: ClassVar[str] = "?"
+    like_escape_char: ClassVar[str] = "\\"
+
+    def escape_like_literal_text(self, text: str) -> str:
+        """Escape plain text for the LIKE pattern layer (not the string literal layer)."""
+        out = []
+        for ch in text:
+            if ch in (self.like_escape_char, self.like_wildcard_multi, self.like_wildcard_single):
+                out.append(self.like_escape_char)
+            out.append(ch)
+        return "".join(out)
+
+    def convert_value_like(self, s: SigmaString, state: ConversionState) -> str:
+        """Render a SigmaString as a quoted ES|QL LIKE pattern with both escape layers."""
+        pattern = []
+        for part in s.s:
+            if part is SpecialChars.WILDCARD_MULTI:
+                pattern.append(self.like_wildcard_multi)
+            elif part is SpecialChars.WILDCARD_SINGLE:
+                pattern.append(self.like_wildcard_single)
+            else:
+                pattern.append(self.escape_like_literal_text(str(part)))
+        pattern = "".join(pattern)
+        # now the string-literal layer
+        literal = pattern.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{literal}"'
+
+    def _selects_wildcard_match(self, v: SigmaString) -> bool:
+        """Mirror of TextQueryBackend.convert_condition_field_eq_val_str branch selection:
+        True only when the LIKE branch is the one that will be taken."""
+        if not v.contains_special():
+            return False
+        if (
+            self.startswith_expression is not None
+            and v.endswith(SpecialChars.WILDCARD_MULTI)
+            and (self.startswith_expression_allow_special or not v[:-1].contains_special())
+        ):
+            return False
+        if (
+            self.endswith_expression is not None
+            and v.startswith(SpecialChars.WILDCARD_MULTI)
+            and (self.endswith_expression_allow_special or not v[1:].contains_special())
+        ):
+            return False
+        if (
+            self.contains_expression is not None
+            and v.startswith(SpecialChars.WILDCARD_MULTI)
+            and v.endswith(SpecialChars.WILDCARD_MULTI)
+            and (self.contains_expression_allow_special or not v[1:-1].contains_special())
+        ):
+            return False
+        return self.wildcard_match_expression is not None
+
+    def convert_condition_field_eq_val_str(self, cond, state):
+        v = cond.value
+        if isinstance(v, SigmaString) and self._selects_wildcard_match(v):
+            if self.is_multivalue_field(cond.field, state):
+                return self.wildcard_match_expression.format(
+                    field=self._mv_joined_field(cond.field),
+                    value=self._mv_like_pattern(v, state),
+                    backend=self,
+                )
+            return self.wildcard_match_expression.format(
+                field=self._ci_field(cond.field),
+                value=self._ci_value(self.convert_value_like(v, state)),
+                backend=self,
+            )
+        if isinstance(v, SigmaString) and self.is_multivalue_field(cond.field, state):
+            if v.contains_special():
+                # startswith / endswith against a multivalued field
+                return self.wildcard_match_expression.format(
+                    field=self._mv_joined_field(cond.field),
+                    value=self._mv_like_pattern(v, state),
+                    backend=self,
+                )
+            return self._mv_match(cond.field, [self.convert_value_str(v, state)])
+        if self.case_insensitive and isinstance(v, SigmaString):
+            # startswith/endswith/eq all take the field as first operand
+            return self._convert_eq_val_str_ci(cond, state)
+        return super().convert_condition_field_eq_val_str(cond, state)
+
+    def _convert_eq_val_str_ci(self, cond, state):
+        v = cond.value
+        field = self._ci_field(cond.field)
+        if (self.startswith_expression is not None and v.endswith(SpecialChars.WILDCARD_MULTI)
+                and not v[:-1].contains_special()):
+            return self.startswith_expression.format(
+                field=field, value=self._ci_value(self.convert_value_str(v[:-1], state)), backend=self)
+        if (self.endswith_expression is not None and v.startswith(SpecialChars.WILDCARD_MULTI)
+                and not v[1:].contains_special()):
+            return self.endswith_expression.format(
+                field=field, value=self._ci_value(self.convert_value_str(v[1:], state)), backend=self)
+        return self.eq_expression.format(
+            field=field, value=self._ci_value(self.convert_value_str(v, state)), backend=self)
+
+    def convert_condition_as_in_expression(self, cond, state):
+        args = getattr(cond, "args", [])
+        field = getattr(args[0], "field", None) if args else None
+        if field and self.is_multivalue_field(field, state) and isinstance(cond, ConditionOR):
+            vals = []
+            for arg in args:
+                val = arg.value
+                if not isinstance(val, SigmaString):
+                    return super().convert_condition_as_in_expression(cond, state)
+                vals.append(self.convert_value_str(val, state))
+            return self._mv_match(field, vals)
+        return super().convert_condition_as_in_expression(cond, state)
+
+    # Same two layers as LIKE, in the wrong order upstream: the quote escape is
+    # added after the escape char is doubled, so its own backslash never is.
+    # Order here is regex layer, then string literal.
+
+    re_escape: ClassVar[Tuple[str, ...]] = ()  # handled in convert_value_re instead
+    re_escape_escape_char: bool = False
+
+    def convert_value_re(self, r: SigmaRegularExpression, state: ConversionState) -> str:
+        regex_text = r.escape((), self.re_escape_char, False, self.re_flag_prefix)
+        regex_text = self.anchor_regex(regex_text)
+        # regex layer: a literal quote must reach the regex engine as \"
+        regex_text = regex_text.replace('"', '\\"')
+        # string-literal layer: backslashes first, then quotes
+        literal = regex_text.replace("\\", "\\\\").replace('"', '\\"')
+        return literal
+
+    # Only LIKE gives * and ? meaning in ES|QL; ==, IN, starts_with and ends_with
+    # treat them literally. Escaping them there emits \* , not a valid escape.
+
+    def convert_value_str(self, s: SigmaString, state: ConversionState) -> str:
+        converted = s.convert(
+            self.escape_char,
+            None,  # * is not special outside LIKE
+            None,  # ? is not special outside LIKE
+            self.str_quote + self.add_escaped,
+            self.filter_chars,
+        )
+        if self.decide_string_quoting(s):
+            return self.quote_string(converted)
+        return converted
+
+    # Scalar == against a multivalued column returns null and the row is dropped --
+    # a silent miss. Sigma value lists are OR, so membership is the right semantics.
+    # MV_INTERSECTS over MV_CONTAINS: the latter returns TRUE for a null needle.
+
+    mv_match_expression: ClassVar[str] = "mv_intersects({field}, [{list}])"
+
+    # ECS fields declared normalize:array, restricted to those a detection rule
+    # plausibly matches on. Over-inclusion is safe -- MV_INTERSECTS is correct on a
+    # single-valued column too -- so a missing entry costs more than a spare one.
+    # event.action is not ECS-normalized as an array but Elastic Defend emits one.
+    # Extended, not replaced, by the multivalue_fields state key and constructor option.
+    default_multivalue_fields: ClassVar[Tuple[str, ...]] = (
+        "event.category", "event.type", "event.action", "tags",
+        "process.args", "process.parent.args", "process.env_vars",
+        "related.hash", "related.hosts", "related.ip", "related.user",
+        "dns.answers", "dns.header_flags", "dns.resolved_ip",
+        "host.ip", "host.mac",
+        "registry.data.strings", "file.attributes", "user.roles",
+    )
+
+    def _declared_multivalue_fields(self, state: ConversionState) -> List[str]:
+        fields = list(self.default_multivalue_fields) + list(self.multivalue_fields)
+        from_state = state.processing_state.get("multivalue_fields") if state else None
+        if isinstance(from_state, str):
+            from_state = [from_state]
+        if from_state:
+            for f in from_state:
+                if f not in fields:
+                    fields.append(f)
+        return fields
+
+    def is_multivalue_field(self, field: str, state: ConversionState) -> bool:
+        if not field:
+            return False
+        for pattern in self._declared_multivalue_fields(state):
+            if field == pattern or fnmatch.fnmatchcase(field, pattern):
+                return True
+        return False
+
+    def mv_unsupported_matches(self) -> List[str]:
+        """Wildcard/regex matches emitted against a declared multivalued field.
+
+        These cannot be made MV-safe with the functions ES|QL provides today and
+        are silent misses.  Collected during conversion for reporting."""
+        return list(self._mv_unsupported)
+
+    def _mv_match(self, field: str, values: List[str]) -> str:
+        return self.mv_match_expression.format(
+            field=self._ci_field(field),
+            list=self.list_separator.join(self._ci_value(v) for v in values),
+        )
+
+    # Sigma |re is PCRE (unanchored substring); ES|QL RLIKE is Lucene regexp and
+    # must match the whole value, so an unanchored pattern matches nothing. EQL has
+    # the same bug. Leading ^ / trailing $ are consumed, being redundant once anchored.
+
+    re_anchor_unanchored_patterns: ClassVar[bool] = True
+
+    def anchor_regex(self, pattern: str) -> str:
+        if not self.re_anchor_unanchored_patterns:
+            return pattern
+        starts = pattern.startswith("^")
+        ends = pattern.endswith("$") and not pattern.endswith("\\$")
+        body = pattern[1:] if starts else pattern
+        if ends:
+            body = body[:-1]
+        return ("" if starts else ".*") + body + ("" if ends else ".*")
+
+    # Sigma treats all values as case-insensitive; EQL's `:` honours that, ES|QL's
+    # ==/LIKE/starts_with/ends_with do not. ES|QL has no =~ and Lucene regexp rejects
+    # inline (?i), so TO_LOWER is the only mechanism. Off by default: semantic change,
+    # unmeasured above lab index sizes. .caseless fields are already normalised.
+
+    case_insensitive_expression: ClassVar[str] = "to_lower({field})"
+    case_insensitive_exempt_suffixes: ClassVar[Tuple[str, ...]] = (".caseless",)
+
+    def _ci_field(self, field: str) -> str:
+        quoted = self.escape_and_quote_field(field)
+        if not self.case_insensitive:
+            return quoted
+        if any(field.endswith(sfx) for sfx in self.case_insensitive_exempt_suffixes):
+            return quoted
+        return self.case_insensitive_expression.format(field=quoted)
+
+    def _ci_value(self, rendered: str) -> str:
+        return rendered.lower() if self.case_insensitive else rendered
+
+    # No MV_LIKE until ES 9.6, and LIKE/starts_with/ends_with return null on an
+    # array. Joining with a separator that cannot occur in data, padded both ends,
+    # turns a per-element match into one LIKE:
+    #   ["conn","notice"] -> \x01conn\x01notice\x01
+    #   element == X -> "*<SEP>X<SEP>*"   startswith -> "*<SEP>X*"
+    #   endswith  -> "*X<SEP>*"           contains   -> "*X*"
+    # Exact equality still uses MV_INTERSECTS, which stays pushdown-friendly.
+
+    mv_join_separator: ClassVar[str] = "\x01"
+    mv_join_expression: ClassVar[str] = 'concat("{sep}", mv_concat({field}, "{sep}"), "{sep}")'
+
+    def _mv_joined_field(self, field: str) -> str:
+        return self.mv_join_expression.format(
+            sep=self.mv_join_separator,
+            field=self._ci_field(field),
+        )
+
+    def _mv_like_pattern(self, s: SigmaString, state: ConversionState) -> str:
+        """LIKE pattern against the padded join: anchor whichever end is closed."""
+        literal = self._ci_value(self.convert_value_like(s, state))
+        body = literal[1:-1]  # strip the surrounding quotes
+        sep = self.mv_join_separator
+        if not s.startswith(SpecialChars.WILDCARD_MULTI):
+            body = "*" + sep + body
+        if not s.endswith(SpecialChars.WILDCARD_MULTI):
+            body = body + sep + "*"
+        return '"' + body + '"'
+
     def finalize_query_default(
         self, rule: SigmaRule, query: str, index: int, state: ConversionState
     ) -> str:
