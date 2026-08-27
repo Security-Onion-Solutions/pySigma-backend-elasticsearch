@@ -33,6 +33,7 @@ class ESQLBackend(TextQueryBackend):
     state_defaults: ClassVar[Dict[str, str]] = {
         "index": "*",
         "metadata": "_id, _index, _version",
+        "keep": "",
     }
 
     precedence: ClassVar[Tuple[ConditionItem, ConditionItem, ConditionItem]] = (
@@ -605,26 +606,35 @@ class ESQLBackend(TextQueryBackend):
             body = body + sep + "*"
         return '"' + body + '"'
 
+    def build_from_clause(
+        self, rule: SigmaRule, query: str, state: ConversionState
+    ) -> str:
+        """Assemble the source, metadata and optional projection around a where clause.
+
+        FROM without a projection returns one column per field mapped across every
+        index the pattern matched, so the `keep` state exists to narrow that. It is
+        applied only to plain rules: a correlation appends STATS after this point,
+        and metadata columns do not survive an aggregation.
+        """
+        metadata = state.processing_state.get("metadata", self.state_defaults["metadata"])
+        index_state = state.processing_state.get("index", self.state_defaults["index"])
+        keep = state.processing_state.get("keep", self.state_defaults["keep"])
+
+        full_query = f"from {index_state} metadata {metadata} | where {query}"
+        if keep and isinstance(rule, SigmaRule):
+            full_query += f" | keep {keep}"
+        return full_query
+
     def finalize_query_default(
         self, rule: SigmaRule, query: str, index: int, state: ConversionState
     ) -> str:
         """Finalize query for default output format by adding the FROM clause."""
-        # Get metadata from processing state
-        metadata = state.processing_state.get("metadata", self.state_defaults["metadata"])
-        index_state = state.processing_state.get("index", self.state_defaults["index"])
-        
-        # Add the 'from' clause to the query
-        return f"from {index_state} metadata {metadata} | where {query}"
+        return self.build_from_clause(rule, query, state)
 
     def finalize_query_kibana_ndjson(
         self, rule: SigmaRule, query: str, index: int, state: ConversionState
     ) -> Dict:
-        # Get metadata from processing state
-        metadata = state.processing_state.get("metadata", self.state_defaults["metadata"])
-        index_state = state.processing_state.get("index", self.state_defaults["index"])
-        
-        # Add the 'from' clause to the query
-        full_query = f"from {index_state} metadata {metadata} | where {query}"
+        full_query = self.build_from_clause(rule, query, state)
         
         return {
             "attributes": {
@@ -752,12 +762,7 @@ class ESQLBackend(TextQueryBackend):
         If you want to have a nice importable NDJSON File for the Security Rule importer
         use pySigma Format 'siem_rule_ndjson' instead.
         """
-        # Get metadata from processing state
-        metadata = state.processing_state.get("metadata", self.state_defaults["metadata"])
-        index_state = state.processing_state.get("index", self.state_defaults["index"])
-        
-        # Add the 'from' clause to the query
-        full_query = f"from {index_state} metadata {metadata} | where {query}"
+        full_query = self.build_from_clause(rule, query, state)
 
         return {
             "name": f"SIGMA - {rule.title}",
@@ -827,12 +832,7 @@ class ESQLBackend(TextQueryBackend):
 
         https://www.elastic.co/guide/en/security/current/rules-ui-management.html#import-export-rules-ui
         """
-        # Get metadata from processing state
-        metadata = state.processing_state.get("metadata", self.state_defaults["metadata"])
-        index_state = state.processing_state.get("index", self.state_defaults["index"])
-        
-        # Add the 'from' clause to the query
-        full_query = f"from {index_state} metadata {metadata} | where {query}"
+        full_query = self.build_from_clause(rule, query, state)
 
         return {
             "id": str(rule.id),

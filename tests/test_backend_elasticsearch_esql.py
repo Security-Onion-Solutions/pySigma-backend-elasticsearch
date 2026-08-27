@@ -768,3 +768,113 @@ tags:
         "query": 'from * metadata _id, _index, _version | where fieldA=="valueA" and fieldB=="valueB"',
         "actions": [],
     }
+
+
+def test_esql_keep_state_projects_plain_rule():
+    """A `keep` state appends a projection, narrowing FROM's full column union."""
+    assert ESQLBackend(
+        ProcessingPipeline.from_yaml(
+            """
+            name: Test
+            priority: 30
+            transformations:
+              - id: set_state_metadata
+                type: set_state
+                key: metadata
+                val: "_id, _index, _source"
+              - id: set_state_keep
+                type: set_state
+                key: keep
+                val: "_id, _index, _source"
+        """
+        )
+    ).convert(
+        SigmaCollection.from_yaml(
+            """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA: valueA
+                condition: sel
+        """
+        )
+    ) == [
+        'from * metadata _id, _index, _source | where fieldA=="valueA" '
+        "| keep _id, _index, _source"
+    ]
+
+
+def test_esql_keep_state_skipped_for_correlation():
+    """Metadata columns do not survive STATS, so a correlation gets no projection."""
+    assert ESQLBackend(
+        ProcessingPipeline.from_yaml(
+            """
+            name: Test
+            priority: 30
+            transformations:
+              - id: set_state_keep
+                type: set_state
+                key: keep
+                val: "_id, _index, _source"
+        """
+        )
+    ).convert(
+        SigmaCollection.from_yaml(
+            """
+title: Base
+name: base_rule
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    sel:
+        fieldA: valueA
+    condition: sel
+---
+title: Correlation
+status: test
+correlation:
+    type: event_count
+    rules:
+        - base_rule
+    group-by:
+        - fieldC
+    timespan: 15m
+    condition:
+        gte: 10
+"""
+        )
+    ) == [
+        'from * metadata _id, _index, _version | where fieldA=="valueA"\n'
+        "| eval timebucket=date_trunc(15minutes, @timestamp) "
+        "| stats event_count=count() by timebucket, fieldC\n"
+        "| where event_count >= 10"
+    ]
+
+
+def test_esql_no_keep_state_is_unchanged():
+    """Absent the state, output is byte-identical to stock."""
+    assert ESQLBackend(
+        ProcessingPipeline.from_yaml(
+            "name: Test\npriority: 30\ntransformations: []\n"
+        )
+    ).convert(
+        SigmaCollection.from_yaml(
+            """
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA: valueA
+                condition: sel
+        """
+        )
+    ) == ['from * metadata _id, _index, _version | where fieldA=="valueA"']
