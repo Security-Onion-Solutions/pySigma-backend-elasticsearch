@@ -2,12 +2,21 @@ from sigma.conversion.deferred import DeferredQueryExpression
 from sigma.conversion.state import ConversionState
 from sigma.rule import SigmaRule, SigmaRuleTag
 from sigma.conversion.base import TextQueryBackend
+from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
 from sigma.conditions import ConditionItem, ConditionAND, ConditionOR, ConditionNOT
-from sigma.types import SigmaCompareExpression, SigmaString, SpecialChars, SigmaRegularExpression
+from sigma.types import (
+    SigmaCompareExpression,
+    SigmaString,
+    SpecialChars,
+    SigmaRegularExpression,
+    SigmaNull,
+)
 import sigma
 import re
 import json
+import math
 import fnmatch
+import ipaddress
 from typing import ClassVar, Dict, Tuple, Pattern, List, Iterable, Optional, Union
 
 
@@ -272,6 +281,7 @@ class ESQLBackend(TextQueryBackend):
         schedule_interval_unit: str = "m",
         multivalue_fields: Optional[Iterable[str]] = None,
         case_insensitive: bool = False,
+        case_insensitive_exempt_fields: Optional[Iterable[str]] = None,
         **kwargs,
     ):
         super().__init__(processing_pipeline, collect_errors, **kwargs)
@@ -280,8 +290,14 @@ class ESQLBackend(TextQueryBackend):
         # Fields known to hold several values per document.  Unioned with the
         # pipeline state key of the same name; entries may be globs.
         self.multivalue_fields = list(multivalue_fields or [])
-        self.case_insensitive = case_insensitive
-        self._mv_unsupported = []
+        self.case_insensitive_exempt_fields = list(case_insensitive_exempt_fields or [])
+        # sigma-cli passes -O values as strings, where "false" is truthy.
+        self.case_insensitive = (
+            case_insensitive.strip().lower() in ("true", "yes", "1")
+            if isinstance(case_insensitive, str)
+            else bool(case_insensitive)
+        )
+        self._null_strict_depth = 0
         self.severity_risk_mapping = {
             "INFORMATIONAL": 1,
             "LOW": 21,
@@ -343,9 +359,9 @@ class ESQLBackend(TextQueryBackend):
 
         # Save the processed index back to the processing state
         state.processing_state["index"] = index_state
-        
+
         return query
-    
+
     # LIKE applies two escape layers (string literal, then the LIKE pattern itself);
     # the inherited conversion applies only the first. Wrong for LIKE, and in a
     # negated filter it inverts the meaning. Built from SigmaString parts so each
@@ -359,7 +375,11 @@ class ESQLBackend(TextQueryBackend):
         """Escape plain text for the LIKE pattern layer (not the string literal layer)."""
         out = []
         for ch in text:
-            if ch in (self.like_escape_char, self.like_wildcard_multi, self.like_wildcard_single):
+            if ch in (
+                self.like_escape_char,
+                self.like_wildcard_multi,
+                self.like_wildcard_single,
+            ):
                 out.append(self.like_escape_char)
             out.append(ch)
         return "".join(out)
@@ -387,7 +407,10 @@ class ESQLBackend(TextQueryBackend):
         if (
             self.startswith_expression is not None
             and v.endswith(SpecialChars.WILDCARD_MULTI)
-            and (self.startswith_expression_allow_special or not v[:-1].contains_special())
+            and (
+                self.startswith_expression_allow_special
+                or not v[:-1].contains_special()
+            )
         ):
             return False
         if (
@@ -400,22 +423,27 @@ class ESQLBackend(TextQueryBackend):
             self.contains_expression is not None
             and v.startswith(SpecialChars.WILDCARD_MULTI)
             and v.endswith(SpecialChars.WILDCARD_MULTI)
-            and (self.contains_expression_allow_special or not v[1:-1].contains_special())
+            and (
+                self.contains_expression_allow_special or not v[1:-1].contains_special()
+            )
         ):
             return False
         return self.wildcard_match_expression is not None
 
     def convert_condition_field_eq_val_str(self, cond, state):
         v = cond.value
+        kind = self.field_type(cond.field, state)
+        if kind is not None and isinstance(v, SigmaString):
+            return self._convert_eq_val_typed(cond, v, kind, state)
         if isinstance(v, SigmaString) and self._selects_wildcard_match(v):
             if self.is_multivalue_field(cond.field, state):
                 return self.wildcard_match_expression.format(
-                    field=self._mv_joined_field(cond.field),
+                    field=self._mv_joined_field(cond.field, state),
                     value=self._mv_like_pattern(v, state),
                     backend=self,
                 )
             return self.wildcard_match_expression.format(
-                field=self._ci_field(cond.field),
+                field=self._ci_field(cond.field, state),
                 value=self._ci_value(self.convert_value_like(v, state)),
                 backend=self,
             )
@@ -423,42 +451,204 @@ class ESQLBackend(TextQueryBackend):
             if v.contains_special():
                 # startswith / endswith against a multivalued field
                 return self.wildcard_match_expression.format(
-                    field=self._mv_joined_field(cond.field),
+                    field=self._mv_joined_field(cond.field, state),
                     value=self._mv_like_pattern(v, state),
                     backend=self,
                 )
-            return self._mv_match(cond.field, [self.convert_value_str(v, state)])
+            return self._mv_match(cond.field, [self.convert_value_str(v, state)], state)
         if self.case_insensitive and isinstance(v, SigmaString):
             # startswith/endswith/eq all take the field as first operand
             return self._convert_eq_val_str_ci(cond, state)
         return super().convert_condition_field_eq_val_str(cond, state)
 
-    def _convert_eq_val_str_ci(self, cond, state):
-        v = cond.value
-        field = self._ci_field(cond.field)
-        if (self.startswith_expression is not None and v.endswith(SpecialChars.WILDCARD_MULTI)
-                and not v[:-1].contains_special()):
-            return self.startswith_expression.format(
-                field=field, value=self._ci_value(self.convert_value_str(v[:-1], state)), backend=self)
-        if (self.endswith_expression is not None and v.startswith(SpecialChars.WILDCARD_MULTI)
-                and not v[1:].contains_special()):
-            return self.endswith_expression.format(
-                field=field, value=self._ci_value(self.convert_value_str(v[1:], state)), backend=self)
+    def _convert_eq_val_typed(self, cond, v: SigmaString, kind: str, state):
+        """A string value landing on a non-string field."""
+        plain = str(v)
+        if not v.contains_special() and self._literal_matches_type(plain, kind):
+            # `ip` keeps its quotes -- ES|QL coerces the string; source.ip==10.0.0.1
+            # is a parse error.
+            value = self.convert_value_str(v, state) if kind == "ip" else plain
+            return self.eq_expression.format(
+                field=self.escape_and_quote_field(cond.field), value=value, backend=self
+            )
+        field = self._typed_field(cond.field, state)
+        if self._selects_wildcard_match(v) or v.contains_special():
+            return self.wildcard_match_expression.format(
+                field=field, value=self.convert_value_like(v, state), backend=self
+            )
         return self.eq_expression.format(
-            field=field, value=self._ci_value(self.convert_value_str(v, state)), backend=self)
+            field=field, value=self.convert_value_str(v, state), backend=self
+        )
 
+    def _convert_eq_val_str_ci(self, cond, state):
+        # STARTS_WITH/ENDS_WITH under TO_LOWER cannot push to Lucene and scan every
+        # document; LIKE can. == and LIKE already push down, so only these are rewritten.
+        v = cond.value
+        field = self._ci_field(cond.field, state)
+        if self.wildcard_match_expression is not None and (
+            v.startswith(SpecialChars.WILDCARD_MULTI)
+            or v.endswith(SpecialChars.WILDCARD_MULTI)
+        ):
+            return self.wildcard_match_expression.format(
+                field=field,
+                value=self._ci_value(self.convert_value_like(v, state)),
+                backend=self,
+            )
+        return self.eq_expression.format(
+            field=field,
+            value=self._ci_value(self.convert_value_str(v, state)),
+            backend=self,
+        )
+
+    # The base implementation bypasses _ci_field/_ci_value, making case_insensitive
+    # a silent no-op on the most common Sigma construct.
     def convert_condition_as_in_expression(self, cond, state):
         args = getattr(cond, "args", [])
         field = getattr(args[0], "field", None) if args else None
-        if field and self.is_multivalue_field(field, state) and isinstance(cond, ConditionOR):
-            vals = []
-            for arg in args:
-                val = arg.value
-                if not isinstance(val, SigmaString):
-                    return super().convert_condition_as_in_expression(cond, state)
-                vals.append(self.convert_value_str(val, state))
-            return self._mv_match(field, vals)
-        return super().convert_condition_as_in_expression(cond, state)
+        if not field or not isinstance(cond, ConditionOR):
+            return super().convert_condition_as_in_expression(cond, state)
+        raw = []
+        for arg in args:
+            val = getattr(arg, "value", None)
+            if not isinstance(val, SigmaString):
+                return super().convert_condition_as_in_expression(cond, state)
+            raw.append(val)
+        kind = self.field_type(field, state)
+        if kind is not None:
+            if all(
+                not v.contains_special() and self._literal_matches_type(str(v), kind)
+                for v in raw
+            ):
+                values = [
+                    self.convert_value_str(v, state) if kind == "ip" else str(v)
+                    for v in raw
+                ]
+                rendered = self.field_in_list_expression.format(
+                    field=self.escape_and_quote_field(field),
+                    op=self.or_in_operator,
+                    list=self.list_separator.join(values),
+                )
+            else:
+                # Per-value path knows how to wrap the field in TO_STRING.
+                return self.convert_condition_or(cond, state)
+        elif self.is_multivalue_field(field, state):
+            rendered = self._mv_match(
+                field, [self.convert_value_str(v, state) for v in raw], state
+            )
+        else:
+            rendered = self.field_in_list_expression.format(
+                field=self._ci_field(field, state),
+                op=self.or_in_operator,
+                list=self.list_separator.join(
+                    self._ci_value(self.convert_value_str(v, state)) for v in raw
+                ),
+            )
+        return self._make_null_strict(field, rendered, None)
+
+    # A flat OR-run parses left-deep and hits ES|QL's depth limit of 300; balancing
+    # it makes depth log2(n). See KNOWN_ISSUES.md "Expression depth limit".
+
+    boolean_group_size: ClassVar[int] = 32
+
+    # In characters, not terms: Lucene's automaton scales with total pattern text.
+    # Over budget the run is left flat, so it fails at parse instead of costing real work.
+    boolean_max_balanced_chars: ClassVar[int] = 131072
+
+    def _balanced_join(self, args: List[str], token: str) -> str:
+        if sum(len(a) for a in args) > self.boolean_max_balanced_chars:
+            return (self.token_separator + token + self.token_separator).join(args)
+        return self._balanced_join_inner(args, token)
+
+    def _balanced_join_inner(self, args: List[str], token: str) -> str:
+        joiner = self.token_separator + token + self.token_separator
+        if len(args) <= self.boolean_group_size:
+            return joiner.join(args)
+        mid = len(args) // 2
+        return self.group_expression.format(
+            expr=self._balanced_join_inner(args[:mid], token)
+            + joiner
+            + self._balanced_join_inner(args[mid:], token)
+        )
+
+    def _convert_condition_args(self, cond, state) -> List[str]:
+        return [
+            converted
+            for converted in (
+                (
+                    self.convert_condition(arg, state)
+                    if self.compare_precedence(cond, arg)
+                    else self.convert_condition_group(arg, state)
+                )
+                for arg in cond.args
+            )
+            if converted is not None
+            and not isinstance(converted, DeferredQueryExpression)
+        ]
+
+    # ES|QL is three-valued: NOT(NULL) is NULL and WHERE keeps only TRUE, so
+    # `not filter` dropped documents whose field was absent; Sigma says those match.
+    # Fixed at the leaf -- COALESCE blocks the pushdown and ES|QL rejects it over QSTR.
+
+    null_strict_expression: ClassVar[str] = "{field} is not null and {expr}"
+
+    def _null_strict(self) -> bool:
+        return self._null_strict_depth > 0
+
+    def _make_null_strict(self, field: Optional[str], expr: str, cond) -> str:
+        """Force a leaf to FALSE rather than NULL when its field is absent."""
+        if not self._null_strict() or not field:
+            return expr
+        if isinstance(getattr(cond, "value", None), SigmaNull):
+            return expr  # `is null` is already null-safe; wrapping inverts it
+        return self.group_expression.format(
+            expr=self.null_strict_expression.format(
+                field=self.escape_and_quote_field(field), expr=expr
+            )
+        )
+
+    def convert_condition_field_eq_val(self, cond, state):
+        expr = super().convert_condition_field_eq_val(cond, state)
+        if isinstance(expr, str):
+            return self._make_null_strict(getattr(cond, "field", None), expr, cond)
+        return expr
+
+    def convert_condition_not(self, cond: ConditionNOT, state: ConversionState):
+        arg = cond.args[0]
+        if arg is None:
+            return None
+        self._null_strict_depth += 1
+        try:
+            if arg.__class__ in self.precedence:
+                converted = self.convert_condition_group(arg, state)
+            else:
+                converted = self.convert_condition(arg, state)
+                if isinstance(converted, DeferredQueryExpression):
+                    return converted.negate()
+        except TypeError:  # pragma: no cover
+            raise NotImplementedError("Operator 'not' not supported by the backend")
+        finally:
+            self._null_strict_depth -= 1
+        if converted is None or isinstance(converted, DeferredQueryExpression):
+            return converted
+        return self.not_token + self.token_separator + converted
+
+    def convert_condition_or(self, cond: ConditionOR, state: ConversionState):
+        try:
+            args = self._convert_condition_args(cond, state)
+        except TypeError:  # pragma: no cover
+            raise NotImplementedError("Operator 'or' not supported by the backend")
+        if not args:
+            return self.empty_or_expression
+        return self._balanced_join(args, self.or_token)
+
+    def convert_condition_and(self, cond: ConditionAND, state: ConversionState):
+        try:
+            args = self._convert_condition_args(cond, state)
+        except TypeError:  # pragma: no cover
+            raise NotImplementedError("Operator 'and' not supported by the backend")
+        if not args:
+            return self.empty_and_expression
+        return self._balanced_join(args, self.and_token)
 
     # Same two layers as LIKE, in the wrong order upstream: the quote escape is
     # added after the escape char is doubled, so its own backslash never is.
@@ -467,8 +657,105 @@ class ESQLBackend(TextQueryBackend):
     re_escape: ClassVar[Tuple[str, ...]] = ()  # handled in convert_value_re instead
     re_escape_escape_char: bool = False
 
-    def convert_value_re(self, r: SigmaRegularExpression, state: ConversionState) -> str:
+    # Sigma is PCRE, RLIKE is Lucene RegExp, and the differences are silent -- the
+    # engine matches nothing. See KNOWN_ISSUES.md "Regular expressions".
+
+    # Metacharacters are syntax a translated pattern keeps; operators are Lucene-only
+    # punctuation PCRE treats as literal, so they are escaped on the way in.
+    lucene_regex_metacharacters: ClassVar[str] = ".?+*|{}[]()" + chr(92)
+    lucene_regex_operators: ClassVar[str] = "&<>#@~"
+    # No Lucene equivalent.  \n, \t and \r are handled separately by widening.
+    lucene_regex_untranslatable: ClassVar[Dict[str, str]] = {
+        "b": "word boundary \\b",
+        "B": "non-word-boundary \\B",
+        "A": "start anchor \\A",
+        "Z": "end anchor \\Z",
+        "z": "end anchor \\z",
+        "G": "match anchor \\G",
+    }
+
+    def _fold_regex_char(self, ch: str, in_class: bool) -> str:
+        if not ("a" <= ch <= "z" or "A" <= ch <= "Z"):
+            return ch
+        if in_class:
+            return ch.lower() + ch.upper()
+        return f"[{ch.lower()}{ch.upper()}]"
+
+    def translate_regex_to_lucene(self, rx: str) -> str:
+        """Rewrite a PCRE pattern into the Lucene dialect, or raise."""
+        out = []
+        i = 0
+        in_class = False
+        fold = False
+        while i < len(rx):
+            c = rx[i]
+            if c == "\\" and i + 1 < len(rx):
+                nxt = rx[i + 1]
+                if nxt in self.lucene_regex_untranslatable:
+                    raise SigmaFeatureNotSupportedByBackendError(
+                        f"Lucene regexp has no equivalent for "
+                        f"{self.lucene_regex_untranslatable[nxt]}"
+                    )
+                if nxt.isdigit() and nxt != "0":
+                    raise SigmaFeatureNotSupportedByBackendError(
+                        "Lucene regexp does not support backreferences"
+                    )
+                if nxt in "ntr":
+                    # Lucene rejects these; \s is the nearest superset. Bare in both
+                    # positions -- bracketed inside a class it nests one and never matches.
+                    out.append("\\s")
+                    i += 2
+                    continue
+                out.append(c + nxt)
+                i += 2
+                continue
+            if in_class:
+                if c == "]":
+                    in_class = False
+                    out.append(c)
+                else:
+                    out.append(self._fold_regex_char(c, True) if fold else c)
+                i += 1
+                continue
+            if c == "[":
+                in_class = True
+                out.append(c)
+                i += 1
+                continue
+            if c == "(":
+                if rx[i : i + 4] == "(?i)":
+                    fold = True  # applies to the remainder, as in PCRE
+                    i += 4
+                    continue
+                if rx[i : i + 3] in ("(?=", "(?!") or rx[i : i + 4] in ("(?<=", "(?<!"):
+                    raise SigmaFeatureNotSupportedByBackendError(
+                        "Lucene regexp does not support lookaround"
+                    )
+                if rx[i : i + 3] == "(?:":
+                    out.append("(")  # Lucene has no non-capturing form
+                    i += 3
+                    continue
+                out.append(c)
+                i += 1
+                continue
+            if c == "?" and out and out[-1] and out[-1][-1] in "*+}":
+                i += 1  # lazy quantifier: same language, drop it
+                continue
+            if c in self.lucene_regex_operators:
+                out.append("\\" + c)
+                i += 1
+                continue
+            out.append(self._fold_regex_char(c, False) if fold else c)
+            i += 1
+        if in_class:  # pragma: no cover - malformed input
+            raise SigmaFeatureNotSupportedByBackendError("unterminated character class")
+        return "".join(out)
+
+    def convert_value_re(
+        self, r: SigmaRegularExpression, state: ConversionState
+    ) -> str:
         regex_text = r.escape((), self.re_escape_char, False, self.re_flag_prefix)
+        regex_text = self.translate_regex_to_lucene(regex_text)
         regex_text = self.anchor_regex(regex_text)
         # regex layer: a literal quote must reach the regex engine as \"
         regex_text = regex_text.replace('"', '\\"')
@@ -503,24 +790,50 @@ class ESQLBackend(TextQueryBackend):
     # event.action is not ECS-normalized as an array but Elastic Defend emits one.
     # Extended, not replaced, by the multivalue_fields state key and constructor option.
     default_multivalue_fields: ClassVar[Tuple[str, ...]] = (
-        "event.category", "event.type", "event.action", "tags",
-        "process.args", "process.parent.args", "process.env_vars",
-        "related.hash", "related.hosts", "related.ip", "related.user",
-        "dns.answers", "dns.header_flags", "dns.resolved_ip",
-        "host.ip", "host.mac",
-        "registry.data.strings", "file.attributes", "user.roles",
+        "event.category",
+        "event.type",
+        "event.action",
+        "tags",
+        "process.args",
+        "process.parent.args",
+        "process.env_vars",
+        "related.hash",
+        "related.hosts",
+        "related.ip",
+        "related.user",
+        "dns.answers",
+        "dns.header_flags",
+        "dns.resolved_ip",
+        "host.ip",
+        "host.mac",
+        "registry.data.strings",
+        "file.attributes",
+        "user.roles",
+        # Multivalued on every document carrying it, so a scalar match returns null
+        # and the 4673/4674/4704 privilege-use rules could never fire.
+        "winlog.event_data.PrivilegeList",
     )
 
-    def _declared_multivalue_fields(self, state: ConversionState) -> List[str]:
-        fields = list(self.default_multivalue_fields) + list(self.multivalue_fields)
-        from_state = state.processing_state.get("multivalue_fields") if state else None
+    @staticmethod
+    def _merge_state_list(
+        declared: Iterable[str], key: str, state: ConversionState
+    ) -> List[str]:
+        """Field globs from the constructor, extended by the pipeline state key."""
+        fields = list(declared)
+        from_state = state.processing_state.get(key) if state else None
         if isinstance(from_state, str):
             from_state = [from_state]
-        if from_state:
-            for f in from_state:
-                if f not in fields:
-                    fields.append(f)
+        for f in from_state or ():
+            if f not in fields:
+                fields.append(f)
         return fields
+
+    def _declared_multivalue_fields(self, state: ConversionState) -> List[str]:
+        return self._merge_state_list(
+            list(self.default_multivalue_fields) + list(self.multivalue_fields),
+            "multivalue_fields",
+            state,
+        )
 
     def is_multivalue_field(self, field: str, state: ConversionState) -> bool:
         if not field:
@@ -530,16 +843,11 @@ class ESQLBackend(TextQueryBackend):
                 return True
         return False
 
-    def mv_unsupported_matches(self) -> List[str]:
-        """Wildcard/regex matches emitted against a declared multivalued field.
-
-        These cannot be made MV-safe with the functions ES|QL provides today and
-        are silent misses.  Collected during conversion for reporting."""
-        return list(self._mv_unsupported)
-
-    def _mv_match(self, field: str, values: List[str]) -> str:
+    def _mv_match(
+        self, field: str, values: List[str], state: Optional[ConversionState] = None
+    ) -> str:
         return self.mv_match_expression.format(
-            field=self._ci_field(field),
+            field=self._ci_field(field, state),
             list=self.list_separator.join(self._ci_value(v) for v in values),
         )
 
@@ -549,6 +857,29 @@ class ESQLBackend(TextQueryBackend):
 
     re_anchor_unanchored_patterns: ClassVar[bool] = True
 
+    def _has_top_level_alternation(self, pattern: str) -> bool:
+        depth = 0
+        i = 0
+        in_class = False
+        while i < len(pattern):
+            c = pattern[i]
+            if c == "\\":
+                i += 2
+                continue
+            if in_class:
+                if c == "]":
+                    in_class = False
+            elif c == "[":
+                in_class = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            elif c == "|" and depth == 0:
+                return True
+            i += 1
+        return False
+
     def anchor_regex(self, pattern: str) -> str:
         if not self.re_anchor_unanchored_patterns:
             return pattern
@@ -557,7 +888,146 @@ class ESQLBackend(TextQueryBackend):
         body = pattern[1:] if starts else pattern
         if ends:
             body = body[:-1]
+        # `.*` binds tighter than `|`: unwrapped, `.*foo|bar.*` parses as
+        # `(.*foo)|(bar.*)`, which changes the meaning.
+        if self._has_top_level_alternation(body):
+            body = self.group_expression.format(expr=body)
         return ("" if starts else ".*") + body + ("" if ends else ".*")
+
+    # A field-less Sigma keyword means "appears anywhere"; ES|QL has no such operator.
+    # QSTR() searches default_field (`*`); the payload is a regexp, not a wildcard
+    # term, which cannot hold punctuation or fold case. See KNOWN_ISSUES.md.
+
+    unbound_search_expression: ClassVar[str] = "qstr({value})"
+
+    # Operators are escaped too: they are enabled by default (RegExp.ALL).
+    @property
+    def lucene_regex_reserved(self) -> str:
+        """Every character that must be escaped when embedding literal text."""
+        return (
+            self.lucene_regex_metacharacters
+            + self.lucene_regex_operators
+            + '"'  # delimits the ES|QL string literal
+            + "/"  # delimits the regexp inside query_string
+        )
+
+    def escape_lucene_regex_literal(self, text: str) -> str:
+        """Escape literal text for use inside a Lucene regexp."""
+        return "".join(
+            "\\" + ch if ch in self.lucene_regex_reserved else ch for ch in text
+        )
+
+    def _case_fold_regex_literal(self, text: str) -> str:
+        """Fold already-escaped literal text to a case-insensitive Lucene regexp.
+
+        Walks the escapes so a backslash is never separated from the character it
+        protects, and folds each character through the same helper the PCRE
+        translator uses -- there is one definition of "fold" for this dialect.
+        """
+        out = []
+        escaped = False
+        for ch in text:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                out.append(ch)
+                escaped = True
+            else:
+                out.append(self._fold_regex_char(ch, False))
+        return "".join(out)
+
+    def unbound_regex_body(self, s: SigmaString) -> str:
+        """Sigma keyword value -> Lucene regexp body, wildcards mapped, case folded."""
+        parts = []
+        for part in s.s:
+            if part is SpecialChars.WILDCARD_MULTI:
+                parts.append(".*")
+            elif part is SpecialChars.WILDCARD_SINGLE:
+                parts.append(".")
+            else:
+                literal = self.escape_lucene_regex_literal(str(part))
+                if self.case_insensitive:
+                    literal = self._case_fold_regex_literal(literal)
+                parts.append(literal)
+        return "".join(parts)
+
+    # A Lucene regexp matches per analyzed TOKEN, so on a `text` field it never
+    # matches a value with spaces or punctuation. A phrase is the mirror image, so
+    # both arms are emitted and OR-ed to cover either mapping.
+    unbound_search_phrase_expression: ClassVar[str] = "qstr({value})"
+    emit_unbound_phrase_arm: ClassVar[bool] = True
+
+    def _esql_literal(self, text: str) -> str:
+        """Escape as an ES|QL string literal: backslashes first, then quotes."""
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    def render_unbound_search(self, body: str, phrase: Optional[str] = None) -> str:
+        """Wrap a regexp body -- and optionally a phrase -- as QSTR calls.
+
+        Two layers, applied once each and in this order: the pattern is anchored
+        with `.*` for Sigma's substring semantics and delimited with `/`, then the
+        whole thing is escaped as an ES|QL string literal.  Getting this order
+        wrong is what broke LIKE and RLIKE upstream.
+        """
+        regex_arm = self.unbound_search_expression.format(
+            value=self._esql_literal(f"/.*{body}.*/")
+        )
+        if not (self.emit_unbound_phrase_arm and phrase):
+            return regex_arm
+        # query_string phrase syntax: the value is quoted, and a literal quote or
+        # backslash inside it is backslash-escaped before the ES|QL layer runs.
+        inner = phrase.replace("\\", "\\\\").replace('"', '\\"')
+        phrase_arm = self.unbound_search_phrase_expression.format(
+            value=self._esql_literal(f'"{inner}"')
+        )
+        return self.group_expression.format(
+            expr=regex_arm
+            + self.token_separator
+            + self.or_token
+            + self.token_separator
+            + phrase_arm
+        )
+
+    def unbound_phrase_text(self, s: SigmaString) -> Optional[str]:
+        """The literal text of a keyword value, or None if no phrase arm is needed.
+
+        A wildcard value cannot be a phrase at all, and a single alphanumeric
+        token is already matched by the regexp arm on an analyzed field, so
+        emitting one costs a second full-text clause for nothing.
+        """
+        parts = []
+        for part in s.s:
+            if part in (SpecialChars.WILDCARD_MULTI, SpecialChars.WILDCARD_SINGLE):
+                return None
+            parts.append(str(part))
+        text = "".join(parts)
+        if not text or text.isalnum():
+            return None
+        return text
+
+    def convert_condition_val_str(self, cond, state) -> str:
+        return self.render_unbound_search(
+            self.unbound_regex_body(cond.value),
+            self.unbound_phrase_text(cond.value),
+        )
+
+    def convert_condition_val_num(self, cond, state) -> str:
+        # Same phrase-arm rule as the string path: a bare number is one token,
+        # so the regexp arm already covers analyzed fields.
+        text = str(cond.value)
+        return self.render_unbound_search(
+            self.escape_lucene_regex_literal(text),
+            None if text.isalnum() else text,
+        )
+
+    def convert_condition_val_re(self, cond, state) -> str:
+        # An unbound |re is already a regexp; it needs the same anchoring every
+        # other RLIKE pattern gets, but no wildcard mapping and no case folding.
+        regex_text = cond.value.escape(
+            (), self.re_escape_char, False, self.re_flag_prefix
+        )
+        return self.render_unbound_search(regex_text.replace("/", "\\/"))
 
     # Sigma treats all values as case-insensitive; EQL's `:` honours that, ES|QL's
     # ==/LIKE/starts_with/ends_with do not. ES|QL has no =~ and Lucene regexp rejects
@@ -567,11 +1037,104 @@ class ESQLBackend(TextQueryBackend):
     case_insensitive_expression: ClassVar[str] = "to_lower({field})"
     case_insensitive_exempt_suffixes: ClassVar[Tuple[str, ...]] = (".caseless",)
 
-    def _ci_field(self, field: str) -> str:
+    # One map, three consumers: TO_LOWER rejects non-strings, numeric literals must
+    # lose their quotes, and string operators need TO_STRING -- so they cannot
+    # disagree. A real string field listed here silently restores case sensitivity.
+
+    default_field_types: ClassVar[Dict[str, str]] = {
+        "*.ip": "ip",
+        "dns.resolved_ip": "ip",
+        "*code_signature.exists": "boolean",
+        "*code_signature.trusted": "boolean",
+        "*code_signature.valid": "boolean",
+        "host.containerized": "boolean",
+        "*.snapshot": "boolean",
+        "*.pid": "numeric",
+        "*.port": "numeric",
+        "*.args_count": "numeric",
+        "*.packets": "numeric",
+        "file.size": "numeric",
+        "event.sequence": "numeric",
+        "event.severity": "numeric",
+        "@timestamp": "date",
+        "event.ingested": "date",
+        "event.created": "date",
+        "file.created": "date",
+        "file.mtime": "date",
+        "file.ctime": "date",
+        "file.accessed": "date",
+    }
+
+    to_string_expression: ClassVar[str] = "to_string({field})"
+
+    def field_type(
+        self, field: str, state: Optional[ConversionState] = None
+    ) -> Optional[str]:
+        """The declared type of a field, or None if it is a string."""
+        if not field:
+            return None
+        declared = dict(self.default_field_types)
+        from_state = state.processing_state.get("field_types") if state else None
+        if isinstance(from_state, dict):
+            declared.update(from_state)
+        for pattern, kind in declared.items():
+            if field == pattern or fnmatch.fnmatchcase(field, pattern):
+                return kind
+        return None
+
+    @staticmethod
+    def _literal_matches_type(text: str, kind: str) -> bool:
+        """Can ES|QL compare this literal to that field type natively?"""
+        if kind == "numeric":
+            if "_" in text:
+                return False  # float() accepts 1_000; ES|QL does not
+            try:
+                return math.isfinite(float(text))  # nan/inf are parse errors
+            except ValueError:
+                return False
+        if kind == "boolean":
+            return text.lower() in ("true", "false")
+        if kind == "ip":
+            # ES|QL coerces an address literal to `ip` and pushes it down; only a
+            # non-address (`'-'`, or a wildcard) needs TO_STRING.
+            try:
+                ipaddress.ip_network(text, strict=False)
+                return True
+            except ValueError:
+                return False
+        return False
+
+    def _typed_field(self, field: str, state: Optional[ConversionState] = None) -> str:
+        """Wrap a non-string field so string operators accept it."""
+        quoted = self.escape_and_quote_field(field)
+        if self.field_type(field, state) is None:
+            return quoted
+        return self.to_string_expression.format(field=quoted)
+
+    # Skipped for non-string fields and `.caseless` subfields, which a normalizer
+    # has already folded. The constructor option and state key are the escape hatch.
+    def _declared_ci_exempt_fields(self, state: ConversionState) -> List[str]:
+        return self._merge_state_list(
+            self.case_insensitive_exempt_fields, "case_insensitive_exempt_fields", state
+        )
+
+    def is_ci_exempt_field(self, field: str, state: ConversionState) -> bool:
+        if not field:
+            return False
+        if any(field.endswith(sfx) for sfx in self.case_insensitive_exempt_suffixes):
+            return True
+        if self.field_type(field, state) is not None:
+            return True
+        for pattern in self._declared_ci_exempt_fields(state):
+            if field == pattern or fnmatch.fnmatchcase(field, pattern):
+                return True
+        return False
+
+    def _ci_field(self, field: str, state: Optional[ConversionState] = None) -> str:
         quoted = self.escape_and_quote_field(field)
         if not self.case_insensitive:
             return quoted
-        if any(field.endswith(sfx) for sfx in self.case_insensitive_exempt_suffixes):
+        if self.is_ci_exempt_field(field, state):
             return quoted
         return self.case_insensitive_expression.format(field=quoted)
 
@@ -587,12 +1150,16 @@ class ESQLBackend(TextQueryBackend):
     # Exact equality still uses MV_INTERSECTS, which stays pushdown-friendly.
 
     mv_join_separator: ClassVar[str] = "\x01"
-    mv_join_expression: ClassVar[str] = 'concat("{sep}", mv_concat({field}, "{sep}"), "{sep}")'
+    mv_join_expression: ClassVar[str] = (
+        'concat("{sep}", mv_concat({field}, "{sep}"), "{sep}")'
+    )
 
-    def _mv_joined_field(self, field: str) -> str:
+    def _mv_joined_field(
+        self, field: str, state: Optional[ConversionState] = None
+    ) -> str:
         return self.mv_join_expression.format(
             sep=self.mv_join_separator,
-            field=self._ci_field(field),
+            field=self._ci_field(field, state),
         )
 
     def _mv_like_pattern(self, s: SigmaString, state: ConversionState) -> str:
@@ -616,7 +1183,9 @@ class ESQLBackend(TextQueryBackend):
         applied only to plain rules: a correlation appends STATS after this point,
         and metadata columns do not survive an aggregation.
         """
-        metadata = state.processing_state.get("metadata", self.state_defaults["metadata"])
+        metadata = state.processing_state.get(
+            "metadata", self.state_defaults["metadata"]
+        )
         index_state = state.processing_state.get("index", self.state_defaults["index"])
         keep = state.processing_state.get("keep", self.state_defaults["keep"])
 
@@ -635,7 +1204,7 @@ class ESQLBackend(TextQueryBackend):
         self, rule: SigmaRule, query: str, index: int, state: ConversionState
     ) -> Dict:
         full_query = self.build_from_clause(rule, query, state)
-        
+
         return {
             "attributes": {
                 "columns": [],
@@ -684,8 +1253,11 @@ class ESQLBackend(TextQueryBackend):
         return list(queries)
 
     def finalize_output_threat_model(self, tags: List[SigmaRuleTag]) -> Iterable[Dict]:
-        from sigma.data.mitre_attack import mitre_attack_tactics, mitre_attack_techniques
-        
+        from sigma.data.mitre_attack import (
+            mitre_attack_tactics,
+            mitre_attack_techniques,
+        )
+
         attack_tags = [t for t in tags if t.namespace == "attack"]
         if not len(attack_tags) >= 2:
             return []
@@ -784,11 +1356,7 @@ class ESQLBackend(TextQueryBackend):
                 "falsePositives": rule.falsepositives,
                 "from": f"now-{self.schedule_interval}{self.schedule_interval_unit}",
                 "immutable": False,
-                "license": (
-                    rule.license 
-                    if rule.license is not None 
-                    else "DRL"
-                ),
+                "license": (rule.license if rule.license is not None else "DRL"),
                 "outputIndex": "",
                 "meta": {
                     "from": "1m",
@@ -859,11 +1427,7 @@ class ESQLBackend(TextQueryBackend):
                 else str(rule.level.name).lower()
             ),
             "note": "",
-            "license": (
-                rule.license 
-                if rule.license is not None 
-                else "DRL"
-            ),
+            "license": (rule.license if rule.license is not None else "DRL"),
             "output_index": "",
             "meta": {
                 "from": "1m",
