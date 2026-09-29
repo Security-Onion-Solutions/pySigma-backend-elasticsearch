@@ -172,12 +172,6 @@ class EqlBackend(TextQueryBackend):
         # "sample": "sample {condition} \n [{search}] {aggregate}",
     }
 
-    value_count_condition_expression: ClassVar[Dict[str, str]] = {
-        "sequence": "with runs={count}"
-    }
-    value_count_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "sequence": "by {field}"
-    }
     temporal_correlation_query: ClassVar[Dict[str, str]] = {
         "sequence": "sample {groupby} \n {search} "
     }
@@ -538,7 +532,9 @@ class EqlBackend(TextQueryBackend):
                 "type": "eql",
                 "language": "eql",
                 "index": self.index_names,
-                "query": f"any where {query}",
+                "query": (
+                    f"any where {query}" if not isinstance(rule, SigmaCorrelationRule) else f"{query}"
+                ),
                 "filters": [],
             },
             "rule_type_id": "siem.queryRule",
@@ -613,7 +609,9 @@ class EqlBackend(TextQueryBackend):
             "type": "eql",
             "language": "eql",
             "index": self.index_names,
-            "query": f"any where {query}",
+            "query": (
+                f"any where {query}" if not isinstance(rule, SigmaCorrelationRule) else f"{query}"
+            ),
             "filters": [],
             "actions": [],
         }
