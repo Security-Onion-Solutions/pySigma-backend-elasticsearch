@@ -2,7 +2,11 @@ from sigma.conversion.deferred import DeferredQueryExpression
 from sigma.conversion.state import ConversionState
 from sigma.rule import SigmaRule, SigmaRuleTag
 from sigma.conversion.base import TextQueryBackend
-from sigma.exceptions import SigmaFeatureNotSupportedByBackendError
+from sigma.correlations import SigmaCorrelationCondition, SigmaCorrelationRule
+from sigma.exceptions import (
+    SigmaConversionError,
+    SigmaFeatureNotSupportedByBackendError,
+)
 from sigma.conditions import ConditionItem, ConditionAND, ConditionOR, ConditionNOT
 from sigma.types import (
     SigmaCompareExpression,
@@ -18,6 +22,32 @@ import math
 import fnmatch
 import ipaddress
 from typing import ClassVar, Dict, Tuple, Pattern, List, Iterable, Optional, Union
+
+# Correlation type: (result column, aggregation)
+CORRELATION_AGGREGATIONS: Dict[str, Tuple[str, str]] = {
+    "event_count": ("event_count", "count()"),
+    "value_count": ("value_count", "count_distinct({field})"),
+    "temporal": ("event_type_count", "count_distinct(event_type)"),
+    "value_sum": ("value_sum", "sum({field})"),
+    "value_avg": ("value_avg", "avg({field})"),
+    "value_percentile": ("value_percentile", "percentile({field}, {percentile})"),
+    "value_median": ("value_median", "median({field})"),
+}
+
+
+def _as_bool(value: Union[bool, str]) -> bool:
+    # sigma-cli passes -O values as strings, where "false" is truthy.
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    return bool(value)
+
+
+def _bucket_aggregation(correlation_type: str) -> str:
+    name, expression = CORRELATION_AGGREGATIONS[correlation_type]
+    return (
+        "| eval timebucket=date_trunc({timespan}, @timestamp)"
+        f" | stats {name}={expression}{{fields}}{{groupby}}"
+    )
 
 
 class ESQLBackend(TextQueryBackend):
@@ -175,6 +205,7 @@ class ESQLBackend(TextQueryBackend):
     # Correlations
     correlation_methods: ClassVar[Dict[str, str]] = {
         "stats": "Correlation with stats command",
+        "window": "Four event-time windows of the timespan, offset by a quarter",
     }
     default_correlation_method: ClassVar[str] = "stats"
     default_correlation_query: ClassVar[str] = {
@@ -198,13 +229,25 @@ class ESQLBackend(TextQueryBackend):
     # correlation_search_field_normalization_expression_joiner: ClassVar[str] = ""
 
     event_count_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats event_count=count(){fields}{groupby}"
+        "stats": _bucket_aggregation("event_count"),
     }
     value_count_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats value_count=count_distinct({field}){fields}{groupby}"
+        "stats": _bucket_aggregation("value_count"),
     }
     temporal_aggregation_expression: ClassVar[Dict[str, str]] = {
-        "stats": "| eval timebucket=date_trunc({timespan}, @timestamp) | stats event_type_count=count_distinct(event_type){fields}{groupby}"
+        "stats": _bucket_aggregation("temporal"),
+    }
+    value_sum_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "stats": _bucket_aggregation("value_sum"),
+    }
+    value_avg_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "stats": _bucket_aggregation("value_avg"),
+    }
+    value_percentile_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "stats": _bucket_aggregation("value_percentile"),
+    }
+    value_median_aggregation_expression: ClassVar[Dict[str, str]] = {
+        "stats": _bucket_aggregation("value_median"),
     }
 
     correlation_fields_expression: ClassVar[Dict[str, str]] = {"stats": "{fields}"}
@@ -239,6 +282,23 @@ class ESQLBackend(TextQueryBackend):
     temporal_condition_expression: ClassVar[Dict[str, str]] = {
         "stats": "| where event_type_count {op} {count}"
     }
+    value_sum_condition_expression: ClassVar[Dict[str, str]] = {
+        "stats": "| where value_sum {op} {count}",
+    }
+    value_avg_condition_expression: ClassVar[Dict[str, str]] = {
+        "stats": "| where value_avg {op} {count}",
+    }
+    value_percentile_condition_expression: ClassVar[Dict[str, str]] = {
+        "stats": "| where value_percentile {op} {count}",
+    }
+    value_median_condition_expression: ClassVar[Dict[str, str]] = {
+        "stats": "| where value_median {op} {count}",
+    }
+
+    _match_operator_pattern: ClassVar[Pattern] = re.compile(
+        r'(`[^`]*`|[\w.@]+) : ("(?:[^"\\]|\\.)*")'
+    )
+    _string_literal_pattern: ClassVar[Pattern] = re.compile(r'"(?:[^"\\]|\\.)*"')
 
     def convert_correlation_aggregation_fields_from_template(
         self,
@@ -271,6 +331,89 @@ class ESQLBackend(TextQueryBackend):
             )
         )
 
+    def convert_correlation_typing_query_postprocess(self, query: str) -> str:
+        """ES|QL rejects `:` inside EVAL; rewrite it to MV_INTERSECTS."""
+        if not self.multivalue_match_operator:
+            return query
+        literals = [m.span() for m in self._string_literal_pattern.finditer(query)]
+
+        def swap(m: re.Match) -> str:
+            if any(start <= m.start() < end for start, end in literals):
+                return m.group(0)
+            return self.mv_match_expression.format(field=m.group(1), list=m.group(2))
+
+        return self._match_operator_pattern.sub(swap, query)
+
+    def convert_correlation_rule_from_template(
+        self, rule: SigmaCorrelationRule, correlation_type: str, method: str
+    ) -> list[str]:
+        if method != "window":
+            return super().convert_correlation_rule_from_template(
+                rule, correlation_type, method
+            )
+        return [self.convert_window_correlation(rule, correlation_type)]
+
+    def convert_window_correlation(
+        self, rule: SigmaCorrelationRule, correlation_type: str
+    ) -> str:
+        """Count each event in four event-time windows of the timespan, offset by a quarter, and keep one row per group."""
+        cond = rule.condition
+        field = percentile = op = None
+        if isinstance(cond, SigmaCorrelationCondition):
+            percentile, op = cond.percentile, cond.op
+            if cond.fieldref:
+                field = self.escape_and_quote_field(cond.fieldref)
+        if correlation_type == "value_percentile" and percentile is None:
+            raise SigmaConversionError(
+                rule,
+                rule.source,
+                "Percentile must be specified in condition for value_percentile correlation type",
+            )
+
+        name, expression = CORRELATION_AGGREGATIONS[correlation_type]
+        aggregation = expression.format(field=field, percentile=percentile)
+        # Report the most extreme window: lowest for a ceiling, highest otherwise.
+        keep = "min" if op and op.name in ("LT", "LTE") else "max"
+        condition = self.convert_correlation_condition_from_template(
+            cond, rule.referenced_rules, correlation_type, "stats"
+        )
+        fields = self.convert_correlation_aggregation_fields_from_template(
+            rule.fields, rule.referenced_rules, rule.group_by, "stats"
+        )
+        groups = [self.escape_and_quote_field(f) for f in rule.group_by or []]
+        by = " by " + ", ".join(groups) if groups else ""
+
+        span = self.convert_timespan(rule.timespan)
+        step = rule.timespan.seconds // 4
+        grids = [f"date_trunc({span}, @timestamp)"] + [
+            f"date_trunc({span}, @timestamp - {k * step} seconds) + {k * step} seconds"
+            for k in (1, 2, 3)
+        ]
+        # Under 4s the grids coincide; dedupe so each window counts once.
+        grid = f"mv_dedupe(mv_append(mv_append({grids[0]}, {grids[1]}), mv_append({grids[2]}, {grids[3]})))"
+
+        parts = [self.convert_correlation_search(rule)]
+        if correlation_type == "temporal":
+            parts.append(self.convert_correlation_typing(rule))
+        if groups:
+            # ES|QL groups events missing a field as null
+            present = " and ".join(f"{g} is not null" for g in groups)
+            parts.append(f"| where {present}")
+        # ElastAlert needs its timestamp field, event.ingested, on every row.
+        parts += [
+            "| where @timestamp is not null",
+            f"| eval w = {grid}",
+            "| mv_expand w",
+            f"| stats {name}={aggregation}, window_start=min(@timestamp), @timestamp=max(@timestamp),"
+            f" event.ingested=max(event.ingested){fields} by {', '.join(['w'] + groups)}",
+            condition,
+            f"| stats {name}={keep}({name}), window_start=min(window_start), @timestamp=max(@timestamp),"
+            f" event.ingested=max(event.ingested){fields}{by}",
+            # An ungrouped stats returns one empty row when nothing matched.
+            "| where @timestamp is not null",
+        ]
+        return "\n".join(parts)
+
     def __init__(
         self,
         processing_pipeline: Optional[
@@ -282,6 +425,7 @@ class ESQLBackend(TextQueryBackend):
         multivalue_fields: Optional[Iterable[str]] = None,
         case_insensitive: bool = False,
         case_insensitive_exempt_fields: Optional[Iterable[str]] = None,
+        multivalue_match_operator: Union[bool, str] = False,
         **kwargs,
     ):
         super().__init__(processing_pipeline, collect_errors, **kwargs)
@@ -291,12 +435,9 @@ class ESQLBackend(TextQueryBackend):
         # pipeline state key of the same name; entries may be globs.
         self.multivalue_fields = list(multivalue_fields or [])
         self.case_insensitive_exempt_fields = list(case_insensitive_exempt_fields or [])
-        # sigma-cli passes -O values as strings, where "false" is truthy.
-        self.case_insensitive = (
-            case_insensitive.strip().lower() in ("true", "yes", "1")
-            if isinstance(case_insensitive, str)
-            else bool(case_insensitive)
-        )
+        self.case_insensitive = _as_bool(case_insensitive)
+        # Use `:` (ES 9.1+, pushed down) instead of MV_INTERSECTS for multivalued fields.
+        self.multivalue_match_operator = _as_bool(multivalue_match_operator)
         self._null_strict_depth = 0
         self.severity_risk_mapping = {
             "INFORMATIONAL": 1,
@@ -846,6 +987,15 @@ class ESQLBackend(TextQueryBackend):
     def _mv_match(
         self, field: str, values: List[str], state: Optional[ConversionState] = None
     ) -> str:
+        # `:` is case-sensitive, so only use it where no case folding applies.
+        if (
+            self.multivalue_match_operator
+            and self.field_type(field, state) is None
+            and (not self.case_insensitive or self.is_ci_exempt_field(field, state))
+        ):
+            quoted = self.escape_and_quote_field(field)
+            matches = [f"{quoted} : {v}" for v in values]
+            return matches[0] if len(matches) == 1 else f"({' or '.join(matches)})"
         return self.mv_match_expression.format(
             field=self._ci_field(field, state),
             list=self.list_separator.join(self._ci_value(v) for v in values),

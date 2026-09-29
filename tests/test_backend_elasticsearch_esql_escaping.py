@@ -192,6 +192,56 @@ def test_multivalue_fields_from_constructor_option():
     ]
 
 
+# The `:` operator for multivalued fields
+
+
+def test_multivalue_match_operator_single_value():
+    backend = ESQLBackend(MV_PIPELINE, multivalue_match_operator=True)
+    assert convert(backend, "    sel:\n        event.type: 'start'") == [
+        PRE + 'event.type : "start"'
+    ]
+
+
+def test_multivalue_match_operator_value_list():
+    backend = ESQLBackend(MV_PIPELINE, multivalue_match_operator="true")
+    assert convert(
+        backend,
+        "    sel:\n        event.type:\n            - 'start'\n            - 'end'",
+    ) == [PRE + '(event.type : "start" or event.type : "end")']
+
+
+@pytest.mark.parametrize("value", [None, "false"])
+def test_multivalue_match_operator_off_by_default_and_for_false_string(value):
+    kwargs = {} if value is None else {"multivalue_match_operator": value}
+    backend = ESQLBackend(MV_PIPELINE, **kwargs)
+    assert convert(backend, "    sel:\n        event.type: 'start'") == [
+        PRE + 'mv_intersects(event.type, ["start"])'
+    ]
+
+
+def test_multivalue_match_operator_keeps_case_folding_unless_exempt():
+    backend = ESQLBackend(
+        MV_PIPELINE,
+        case_insensitive=True,
+        case_insensitive_exempt_fields=["tags"],
+        multivalue_match_operator=True,
+    )
+    assert convert(backend, "    sel:\n        tags: 'dns'") == [PRE + 'tags : "dns"']
+    assert convert(backend, "    sel:\n        event.type: 'Start'") == [
+        PRE + 'mv_intersects(to_lower(event.type), ["start"])'
+    ]
+
+
+def test_multivalue_match_operator_under_not():
+    backend = ESQLBackend(MV_PIPELINE, multivalue_match_operator=True)
+    rule = _rule(
+        "    sel:\n        host.os.type: 'linux'\n    filter:\n        tags: 'noisy'"
+    ).replace("condition: sel", "condition: sel and not filter")
+    assert backend.convert(SigmaCollection.from_yaml(rule)) == [
+        PRE + 'host.os.type=="linux" and not (tags is not null and tags : "noisy")'
+    ]
+
+
 # Case-insensitive matching
 
 
