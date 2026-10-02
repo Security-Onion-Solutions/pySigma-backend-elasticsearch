@@ -2,6 +2,7 @@ import pytest
 from sigma.collection import SigmaCollection
 from sigma.backends.elasticsearch.elasticsearch_esql import ESQLBackend
 from sigma.processing.pipeline import ProcessingPipeline
+from sigma.exceptions import SigmaConfigurationError
 
 
 @pytest.fixture
@@ -878,3 +879,132 @@ def test_esql_no_keep_state_is_unchanged():
         """
         )
     ) == ['from * metadata _id, _index, _version | where fieldA=="valueA"']
+
+
+UNMAPPED_RULE = """
+title: Test
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    sel:
+        fieldA: valueA
+    condition: sel
+"""
+
+
+def unmapped_pipeline(val: str) -> ProcessingPipeline:
+    return ProcessingPipeline.from_yaml(
+        f"""
+        name: test-pipeline
+        priority: 30
+        transformations:
+          - id: set_state_unmapped_fields
+            type: set_state
+            key: unmapped_fields
+            val: "{val}"
+        """
+    )
+
+
+def test_elasticsearch_esql_unmapped_fields_state():
+    assert ESQLBackend(processing_pipeline=unmapped_pipeline("nullify")).convert(
+        SigmaCollection.from_yaml(UNMAPPED_RULE)
+    ) == [
+        'SET unmapped_fields="nullify"; from * metadata _id, _index, _version | where fieldA=="valueA"'
+    ]
+
+
+def test_elasticsearch_esql_unmapped_fields_state_case():
+    assert ESQLBackend(processing_pipeline=unmapped_pipeline("NULLIFY")).convert(
+        SigmaCollection.from_yaml(UNMAPPED_RULE)
+    ) == [
+        'SET unmapped_fields="nullify"; from * metadata _id, _index, _version | where fieldA=="valueA"'
+    ]
+
+
+def test_elasticsearch_esql_unmapped_fields_default(esql_backend: ESQLBackend):
+    assert esql_backend.convert(SigmaCollection.from_yaml(UNMAPPED_RULE)) == [
+        'from * metadata _id, _index, _version | where fieldA=="valueA"'
+    ]
+
+
+def test_elasticsearch_esql_unmapped_fields_option():
+    assert ESQLBackend(unmapped_fields="nullify").convert(
+        SigmaCollection.from_yaml(UNMAPPED_RULE)
+    ) == [
+        'SET unmapped_fields="nullify"; from * metadata _id, _index, _version | where fieldA=="valueA"'
+    ]
+
+
+def test_elasticsearch_esql_unmapped_fields_option_overrides_state():
+    assert ESQLBackend(
+        processing_pipeline=unmapped_pipeline("nullify"), unmapped_fields="fail"
+    ).convert(SigmaCollection.from_yaml(UNMAPPED_RULE)) == [
+        'SET unmapped_fields="fail"; from * metadata _id, _index, _version | where fieldA=="valueA"'
+    ]
+
+
+def test_elasticsearch_esql_unmapped_fields_invalid_option():
+    with pytest.raises(SigmaConfigurationError, match="unmapped_fields must be one of"):
+        ESQLBackend(unmapped_fields="ignore")
+
+
+def test_elasticsearch_esql_unmapped_fields_invalid_state():
+    with pytest.raises(SigmaConfigurationError, match="unmapped_fields must be one of"):
+        ESQLBackend(processing_pipeline=unmapped_pipeline("ignore")).convert(
+            SigmaCollection.from_yaml(UNMAPPED_RULE)
+        )
+
+
+def test_elasticsearch_esql_unmapped_fields_correlation():
+    pipeline = ProcessingPipeline.from_yaml(
+        """
+        name: test-pipeline
+        priority: 30
+        transformations:
+          - id: set_state_unmapped_fields
+            type: set_state
+            key: unmapped_fields
+            val: nullify
+          - id: set_state_index
+            type: set_state
+            key: index
+            val: logs-test-*
+            rule_conditions:
+              - type: logsource
+                category: test_category
+        """
+    )
+    queries = ESQLBackend(processing_pipeline=pipeline).convert(
+        SigmaCollection.from_yaml(
+            """
+title: Correlation_Test
+correlation:
+  type: event_count
+  rules:
+    - base_rule
+  group-by:
+    - fieldB
+  timespan: 15m
+  condition:
+    gte: 5
+---
+title: Base_Rule
+status: test
+name: base_rule
+logsource:
+  category: test_category
+detection:
+  sel:
+    fieldA: valueA
+  condition: sel
+"""
+        )
+    )
+    assert len(queries) == 1
+    assert queries[0].startswith(
+        'SET unmapped_fields="nullify"; from logs-test-* metadata _id, _index, _version | where fieldA=="valueA"\n'
+    )
+    assert queries[0].count("SET ") == 1

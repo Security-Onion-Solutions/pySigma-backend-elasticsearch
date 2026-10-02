@@ -4,6 +4,7 @@ from sigma.rule import SigmaRule, SigmaRuleTag
 from sigma.conversion.base import TextQueryBackend
 from sigma.correlations import SigmaCorrelationCondition, SigmaCorrelationRule
 from sigma.exceptions import (
+    SigmaConfigurationError,
     SigmaConversionError,
     SigmaFeatureNotSupportedByBackendError,
 )
@@ -42,6 +43,21 @@ def _as_bool(value: Union[bool, str]) -> bool:
     return bool(value)
 
 
+# Values Elasticsearch accepts for the unmapped_fields setting of the SET directive.
+UNMAPPED_FIELDS_MODES = ("fail", "nullify", "load")
+
+
+def _unmapped_fields_mode(value: Optional[str]) -> Optional[str]:
+    if value is None or str(value).strip() == "":
+        return None
+    mode = str(value).strip().lower()
+    if mode not in UNMAPPED_FIELDS_MODES:
+        raise SigmaConfigurationError(
+            f"unmapped_fields must be one of {', '.join(UNMAPPED_FIELDS_MODES)}, not '{value}'"
+        )
+    return mode
+
+
 def _bucket_aggregation(correlation_type: str) -> str:
     name, expression = CORRELATION_AGGREGATIONS[correlation_type]
     return (
@@ -73,6 +89,7 @@ class ESQLBackend(TextQueryBackend):
         "index": "*",
         "metadata": "_id, _index, _version",
         "keep": "",
+        "unmapped_fields": "",
     }
 
     precedence: ClassVar[Tuple[ConditionItem, ConditionItem, ConditionItem]] = (
@@ -426,6 +443,7 @@ class ESQLBackend(TextQueryBackend):
         case_insensitive: bool = False,
         case_insensitive_exempt_fields: Optional[Iterable[str]] = None,
         multivalue_match_operator: Union[bool, str] = False,
+        unmapped_fields: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(processing_pipeline, collect_errors, **kwargs)
@@ -438,6 +456,9 @@ class ESQLBackend(TextQueryBackend):
         self.case_insensitive = _as_bool(case_insensitive)
         # Use `:` (ES 9.1+, pushed down) instead of MV_INTERSECTS for multivalued fields.
         self.multivalue_match_operator = _as_bool(multivalue_match_operator)
+        # SET unmapped_fields (technical preview in ES 9.4): "nullify" reads fields that no queried index
+        # maps as null instead of failing the query. Overrides the pipeline state key.
+        self.unmapped_fields = _unmapped_fields_mode(unmapped_fields)
         self._null_strict_depth = 0
         self.severity_risk_mapping = {
             "INFORMATIONAL": 1,
@@ -1332,6 +1353,9 @@ class ESQLBackend(TextQueryBackend):
         index the pattern matched, so the `keep` state exists to narrow that. It is
         applied only to plain rules: a correlation appends STATS after this point,
         and metadata columns do not survive an aggregation.
+
+        The `unmapped_fields` backend option, or else the pipeline state key of the
+        same name, prefixes the query with a SET directive for it.
         """
         metadata = state.processing_state.get(
             "metadata", self.state_defaults["metadata"]
@@ -1342,6 +1366,14 @@ class ESQLBackend(TextQueryBackend):
         full_query = f"from {index_state} metadata {metadata} | where {query}"
         if keep and isinstance(rule, SigmaRule):
             full_query += f" | keep {keep}"
+
+        unmapped_fields = self.unmapped_fields or _unmapped_fields_mode(
+            state.processing_state.get(
+                "unmapped_fields", self.state_defaults["unmapped_fields"]
+            )
+        )
+        if unmapped_fields:
+            full_query = f'SET unmapped_fields="{unmapped_fields}"; {full_query}'
         return full_query
 
     def finalize_query_default(
