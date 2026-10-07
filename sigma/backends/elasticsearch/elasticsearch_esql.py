@@ -498,7 +498,11 @@ class ESQLBackend(TextQueryBackend):
             f" event.ingested=max(event.ingested){fields}{g['first']} by {', '.join(['w'] + g['by'])}",
             *counted,
             condition,
-            f"| stats {name}=max({name}), window_start=min(window_start), @timestamp=max(@timestamp),"
+            # Report the busiest window, not the span of every qualifying one, which can exceed the
+            # timespan. Among tied windows the latest start keeps the span within the timespan.
+            f"| inline stats busiest=max({name}){by}",
+            f"| where {name} == busiest",
+            f"| stats {name}=max({name}), window_start=max(window_start), @timestamp=max(@timestamp),"
             f" event.ingested=max(event.ingested){fields}{g['again']}{by}",
             *([g["rename"]] if g["rename"] else []),
             # An ungrouped stats returns one empty row when nothing matched.

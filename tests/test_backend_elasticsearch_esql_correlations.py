@@ -649,7 +649,9 @@ def test_window_correlation_rule(
 | mv_expand w
 | stats {name}={aggregation}, window_start=min(@timestamp), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by w, fieldC
 | where {name} {comparison}
-| stats {name}=max({name}), window_start=min(window_start), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by fieldC
+| inline stats busiest=max({name}) by fieldC
+| where {name} == busiest
+| stats {name}=max({name}), window_start=max(window_start), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by fieldC
 | where @timestamp is not null
 | sort {name} desc"""
     ]
@@ -688,7 +690,9 @@ def test_window_correlation_rule_no_group_by(esql_backend: ESQLBackend):
 | mv_expand w
 | stats event_count=count(), window_start=min(@timestamp), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by w
 | where event_count >= 5
-| stats event_count=max(event_count), window_start=min(window_start), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD)
+| inline stats busiest=max(event_count)
+| where event_count == busiest
+| stats event_count=max(event_count), window_start=max(window_start), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD)
 | where @timestamp is not null
 | sort event_count desc"""
     ]
@@ -930,11 +934,12 @@ def test_case_insensitive_window_groups_lowercased_with_spellings():
         " @timestamp=max(@timestamp), event.ingested=max(event.ingested), user.name_spellings=values(user.name)"
         " by w, folded_0=to_lower(to_string(user.name)), source.ip"
     )
-    assert lines[7] == (
-        "| stats value_count=max(value_count), window_start=min(window_start), @timestamp=max(@timestamp),"
+    assert lines[7] == "| inline stats busiest=max(value_count) by folded_0, source.ip"
+    assert lines[9] == (
+        "| stats value_count=max(value_count), window_start=max(window_start), @timestamp=max(@timestamp),"
         " event.ingested=max(event.ingested), user.name_spellings=values(user.name_spellings) by folded_0, source.ip"
     )
-    assert lines[8] == "| rename folded_0 as user.name"
+    assert lines[10] == "| rename folded_0 as user.name"
 
 
 def test_case_insensitive_trailing_groups_lowercased_with_spellings():
@@ -962,3 +967,13 @@ def test_case_sensitive_groups_unchanged(esql_backend: ESQLBackend):
     query = esql_backend.convert(metric_rule(CASE_FOLDED.format(condition="gte: 5")), correlation_method="window")[0]
     assert "folded_" not in query
     assert "by w, user.name, source.ip" in query
+
+
+def test_window_correlation_reports_the_busiest_window(esql_backend: ESQLBackend):
+    """ Overlapping windows can all qualify; their combined span would exceed the timespan. """
+    lines = esql_backend.convert(metric_rule(WINDOW_GROUPED, fields=True), correlation_method="window")[0].split("\n")
+    i = lines.index("| where event_count >= 5")
+    assert lines[i + 1] == "| inline stats busiest=max(event_count) by fieldC"
+    assert lines[i + 2] == "| where event_count == busiest"
+    # the latest start among tied busiest windows keeps the span within the timespan
+    assert lines[i + 3].startswith("| stats event_count=max(event_count), window_start=max(window_start),")
