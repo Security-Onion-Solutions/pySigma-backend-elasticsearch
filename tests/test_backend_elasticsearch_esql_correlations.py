@@ -624,14 +624,6 @@ GRID_10M = "mv_dedupe(mv_append(mv_append(date_trunc(10minutes, @timestamp), dat
         ("event_count", "gte: 5", "count()", ">= 5"),
         ("value_count", "field: fieldD\n        gte: 5", "count_distinct(fieldD)", ">= 5"),
         ("value_sum", "field: bytes_out\n        gt: 5", "sum(bytes_out)", "> 5"),
-        ("value_avg", "field: bytes_out\n        gt: 5", "avg(bytes_out)", "> 5"),
-        (
-            "value_percentile",
-            "field: bytes_out\n        percentile: 95\n        gt: 5",
-            "percentile(bytes_out, 95)",
-            "> 5",
-        ),
-        ("value_median", "field: bytes_out\n        gt: 5", "median(bytes_out)", "> 5"),
     ],
 )
 def test_window_correlation_rule(
@@ -658,7 +650,8 @@ def test_window_correlation_rule(
 | stats {name}={aggregation}, window_start=min(@timestamp), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by w, fieldC
 | where {name} {comparison}
 | stats {name}=max({name}), window_start=min(window_start), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by fieldC
-| where @timestamp is not null"""
+| where @timestamp is not null
+| sort {name} desc"""
     ]
 
 
@@ -666,7 +659,7 @@ def test_window_correlation_drops_events_missing_a_group_by_field(esql_backend: 
     rule = metric_rule(WINDOW_GROUPED.replace("        - fieldC\n", "        - fieldC\n        - x-real-ip\n"), fields=True)
     lines = esql_backend.convert(rule, correlation_method="window")[0].split("\n")
     assert lines[1] == "| where fieldC is not null and `x-real-ip` is not null"
-    assert lines[-2].endswith("by fieldC, `x-real-ip`")
+    assert lines[-3].endswith("by fieldC, `x-real-ip`")
 
 
 def test_window_correlation_quotes_field_names(esql_backend: ESQLBackend):
@@ -696,7 +689,8 @@ def test_window_correlation_rule_no_group_by(esql_backend: ESQLBackend):
 | stats event_count=count(), window_start=min(@timestamp), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by w
 | where event_count >= 5
 | stats event_count=max(event_count), window_start=min(window_start), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD)
-| where @timestamp is not null"""
+| where @timestamp is not null
+| sort event_count desc"""
     ]
 
 
@@ -707,11 +701,103 @@ def test_window_correlation_short_timespan_counts_each_window_once(esql_backend:
     assert "date_trunc(3seconds, @timestamp - 0 seconds) + 0 seconds" in query
 
 
-def test_window_correlation_ceiling_keeps_min(esql_backend: ESQLBackend):
-    rule = metric_rule(WINDOW_GROUPED.replace("gte: 5", "lt: 5"), fields=True)
+@pytest.mark.parametrize(
+    "correlation_type,condition,aggregation,comparison",
+    [
+        ("event_count", "lt: 5", "count()", "< 5"),
+        ("event_count", "lte: 5", "count()", "<= 5"),
+        ("event_count", "eq: 5", "count()", "== 5"),
+        ("value_count", "field: fieldD\n        neq: 5", "count_distinct(fieldD)", "!= 5"),
+        ("value_avg", "field: bytes_out\n        gt: 5", "avg(bytes_out)", "> 5"),
+        (
+            "value_percentile",
+            "field: bytes_out\n        percentile: 95\n        gte: 5",
+            "percentile(bytes_out, 95)",
+            ">= 5",
+        ),
+        ("value_median", "field: bytes_out\n        gt: 5", "median(bytes_out)", "> 5"),
+    ],
+)
+def test_window_correlation_falls_back_to_a_trailing_window(
+    correlation_type, condition, aggregation, comparison
+):
+    """ A partial window at a run's edge could meet these conditions, so they count one complete window. """
+    rule = metric_rule(
+        f"""    type: {correlation_type}
+    rules:
+        - base_rule
+    group-by:
+        - fieldC
+    timespan: 10m
+    condition:
+        {condition}""",
+        fields=True,
+    )
+    backend = ESQLBackend(query_delay="30", correlation_allowance="600")
+    name = correlation_type
+    order = "asc" if comparison.startswith("<") else "desc"
+    assert backend.convert(rule, correlation_method="window") == [
+        f"""from * metadata _id, _index, _version | where fieldA=="value1"
+| where fieldC is not null
+| where @timestamp >= now() - 1230 seconds and @timestamp < now() - 630 seconds
+| stats {name}={aggregation}, window_start=min(@timestamp), @timestamp=max(@timestamp), event.ingested=max(event.ingested), fieldD=values(fieldD) by fieldC
+| where {name} {comparison}
+| where @timestamp is not null
+| sort {name} {order}"""
+    ]
+
+
+def test_trailing_window_defaults_to_no_offset(esql_backend: ESQLBackend):
+    rule = metric_rule(WINDOW_GROUPED.replace("gte: 5", "lt: 5").replace("    group-by:\n        - fieldC\n", ""))
     lines = esql_backend.convert(rule, correlation_method="window")[0].split("\n")
-    assert "| where event_count < 5" in lines
-    assert lines[-2].startswith("| stats event_count=min(event_count),")
+    assert lines[1] == "| where @timestamp >= now() - 600 seconds and @timestamp < now() - 0 seconds"
+    assert lines[2].endswith("event.ingested=max(event.ingested)")
+
+
+def test_trailing_window_temporal_types_events(esql_backend: ESQLBackend):
+    rule = SigmaCollection.from_yaml(
+        """
+title: Temporal
+status: test
+correlation:
+    type: temporal
+    rules:
+        - base_rule_1
+        - base_rule_2
+    group-by:
+        - fieldC
+    timespan: 10m
+    condition:
+        eq: 1
+---
+title: Base 1
+name: base_rule_1
+status: test
+logsource:
+    category: test
+detection:
+    selection:
+        fieldA: a
+    condition: selection
+---
+title: Base 2
+name: base_rule_2
+status: test
+logsource:
+    category: test
+detection:
+    selection:
+        fieldA: b
+    condition: selection
+"""
+    )
+    lines = esql_backend.convert(rule, correlation_method="window")[0].split("\n")
+    assert lines[1] == '| eval event_type_0=case(fieldA=="a", 1), event_type_1=case(fieldA=="b", 1)'
+    assert lines[4].startswith("| stats event_type_0=count(event_type_0), event_type_1=count(event_type_1), window_start=")
+    assert lines[5] == "| eval event_type_count=case(event_type_0 > 0, 1, 0) + case(event_type_1 > 0, 1, 0)"
+    # the flags stay out of the alert
+    assert lines[6] == "| drop event_type_0, event_type_1"
+    assert lines[7] == "| where event_type_count == 1"
 
 
 def test_window_correlation_temporal_types_before_the_grids(esql_backend: ESQLBackend):
@@ -751,10 +837,14 @@ correlation:
     )
     query = esql_backend.convert(rule, correlation_method="window")[0]
     lines = query.split("\n")
-    assert lines[1] == '| eval event_type=case(fieldA=="value1", "base_rule_1", fieldA=="value2", "base_rule_2")'
+    assert lines[1] == '| eval event_type_0=case(fieldA=="value1", 1), event_type_1=case(fieldA=="value2", 1)'
     assert lines[2] == "| where fieldC is not null"
     assert lines[3] == "| where @timestamp is not null"
     assert "date_trunc(1hours, @timestamp - 900 seconds) + 900 seconds" in query
+    assert lines[6].startswith("| stats event_type_0=count(event_type_0), event_type_1=count(event_type_1), window_start=")
+    # an event matching both rules counts for each
+    assert lines[7] == "| eval event_type_count=case(event_type_0 > 0, 1, 0) + case(event_type_1 > 0, 1, 0)"
+    assert lines[8] == "| where event_type_count >= 2"
     assert "| stats event_type_count=max(event_type_count)" in query
 
 
@@ -799,8 +889,8 @@ correlation:
     # EVAL rejects `:`
     assert lines[0].endswith('| where (tags : "dns" and fieldA=="a : \\"b") or (tags : "conn")')
     assert lines[1] == (
-        '| eval event_type=case(mv_intersects(tags, ["dns"]) and fieldA=="a : \\"b", "base_rule_1",'
-        ' mv_intersects(tags, ["conn"]), "base_rule_2")'
+        '| eval event_type_0=case(mv_intersects(tags, ["dns"]) and fieldA=="a : \\"b", 1),'
+        ' event_type_1=case(mv_intersects(tags, ["conn"]), 1)'
     )
 
 
@@ -817,3 +907,58 @@ def test_window_correlation_percentile_required(esql_backend: ESQLBackend):
     )
     with pytest.raises(SigmaConversionError, match="Percentile must be specified"):
         esql_backend.convert(rule, correlation_method="window")
+
+
+CASE_FOLDED = """    type: value_count
+    rules:
+        - base_rule
+    group-by:
+        - user.name
+        - source.ip
+    timespan: 10m
+    condition:
+        field: fieldD
+        {condition}"""
+
+
+def test_case_insensitive_window_groups_lowercased_with_spellings():
+    """ Windows records an account as typed, so Admin and admin must count together. """
+    rule = metric_rule(CASE_FOLDED.format(condition="gte: 5"))
+    lines = ESQLBackend(case_insensitive=True).convert(rule, correlation_method="window")[0].split("\n")
+    assert lines[5] == (
+        "| stats value_count=count_distinct(to_lower(to_string(fieldD))), window_start=min(@timestamp),"
+        " @timestamp=max(@timestamp), event.ingested=max(event.ingested), user.name_spellings=values(user.name)"
+        " by w, folded_0=to_lower(to_string(user.name)), source.ip"
+    )
+    assert lines[7] == (
+        "| stats value_count=max(value_count), window_start=min(window_start), @timestamp=max(@timestamp),"
+        " event.ingested=max(event.ingested), user.name_spellings=values(user.name_spellings) by folded_0, source.ip"
+    )
+    assert lines[8] == "| rename folded_0 as user.name"
+
+
+def test_case_insensitive_trailing_groups_lowercased_with_spellings():
+    rule = metric_rule(CASE_FOLDED.format(condition="lt: 5"))
+    lines = ESQLBackend(case_insensitive=True).convert(rule, correlation_method="window")[0].split("\n")
+    assert lines[3].endswith(
+        ", user.name_spellings=values(user.name) by folded_0=to_lower(to_string(user.name)), source.ip"
+    )
+    assert lines[4] == "| rename folded_0 as user.name"
+    assert lines[5] == "| where value_count < 5"
+    # the quietest groups are the matches, so a row limit must keep them
+    assert lines[-1] == "| sort value_count asc"
+
+
+def test_case_folding_skips_exempt_fields():
+    rule = metric_rule(CASE_FOLDED.format(condition="gte: 5"))
+    backend = ESQLBackend(case_insensitive=True, case_insensitive_exempt_fields=["user.name", "fieldD"])
+    query = backend.convert(rule, correlation_method="window")[0]
+    assert "folded_" not in query
+    assert "_spellings" not in query
+    assert "count_distinct(fieldD)" in query
+
+
+def test_case_sensitive_groups_unchanged(esql_backend: ESQLBackend):
+    query = esql_backend.convert(metric_rule(CASE_FOLDED.format(condition="gte: 5")), correlation_method="window")[0]
+    assert "folded_" not in query
+    assert "by w, user.name, source.ip" in query

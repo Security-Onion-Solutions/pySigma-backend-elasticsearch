@@ -105,7 +105,8 @@ class EqlBackend(TextQueryBackend):
     re_expression: ClassVar[str] = '{field} regex~ "{regex}"'
     # Character used for escaping in regular expressions
     re_escape_char: ClassVar[str] = "\\"
-    re_escape: ClassVar[Tuple[str]] = ("/",)
+    # EQL rejects "\/"; only a quote would end the string.
+    re_escape: ClassVar[Tuple[str]] = ('"',)
     # Escape the escape char for JSON compatibility.
     # According to Elastic documentation, backslash is used for escaping in JSON,
     # so backslashes in regex patterns must be escaped to ensure compatibility when

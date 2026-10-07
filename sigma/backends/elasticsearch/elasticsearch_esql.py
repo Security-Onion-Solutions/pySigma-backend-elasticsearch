@@ -35,6 +35,9 @@ CORRELATION_AGGREGATIONS: Dict[str, Tuple[str, str]] = {
     "value_median": ("value_median", "median({field})"),
 }
 
+# A partial window can raise these as well as lower them.
+WINDOW_UNSAFE_TYPES = {"value_avg", "value_percentile", "value_median"}
+
 
 def _as_bool(value: Union[bool, str]) -> bool:
     # sigma-cli passes -O values as strings, where "false" is truthy.
@@ -222,7 +225,7 @@ class ESQLBackend(TextQueryBackend):
     # Correlations
     correlation_methods: ClassVar[Dict[str, str]] = {
         "stats": "Correlation with stats command",
-        "window": "Four event-time windows of the timespan, offset by a quarter",
+        "window": "Four event-time windows of the timespan, offset by a quarter; one trailing window where a partial window could falsely match",
     }
     default_correlation_method: ClassVar[str] = "stats"
     default_correlation_query: ClassVar[str] = {
@@ -370,6 +373,66 @@ class ESQLBackend(TextQueryBackend):
             )
         return [self.convert_window_correlation(rule, correlation_type)]
 
+    def correlation_state(self) -> Optional[ConversionState]:
+        """The pipeline state, for field types and case-insensitivity exemptions."""
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        return ConversionState(processing_state=dict(pipeline.state)) if pipeline else None
+
+    def folds_case(self, field: str, state: Optional[ConversionState]) -> bool:
+        return self.case_insensitive and not self.is_ci_exempt_field(field, state)
+
+    def correlation_groups(self, rule: SigmaCorrelationRule) -> Dict[str, object]:
+        """Group-by terms; with case_insensitive, string values group lowercased and keep their spellings."""
+        state = self.correlation_state()
+        quoted, by, names, first, again, renames = [], [], [], [], [], []
+        for i, field in enumerate(rule.group_by or []):
+            q = self.escape_and_quote_field(field)
+            quoted.append(q)
+            if not self.folds_case(field, state):
+                by.append(q)
+                names.append(q)
+                continue
+            # BY into the field's own name would hide the original from values()
+            folded = f"folded_{i}"
+            spellings = self.escape_and_quote_field(f"{field}_spellings")
+            by.append(f"{folded}=to_lower(to_string({q}))")
+            names.append(folded)
+            first.append(f", {spellings}=values({q})")
+            # a second stats merges the lists
+            again.append(f", {spellings}=values({spellings})")
+            renames.append(f"{folded} as {q}")
+        return {
+            "quoted": quoted,
+            "by": by,
+            "names": names,
+            "first": "".join(first),
+            "again": "".join(again),
+            "rename": f"| rename {', '.join(renames)}" if renames else None,
+        }
+
+    def correlation_value_field(self, field: Optional[str], fieldref: Optional[str]) -> Optional[str]:
+        """value_count's field, lowercased like the group values so case variants count once."""
+        if field and fieldref and self.folds_case(fieldref, self.correlation_state()):
+            return f"to_lower(to_string({field}))"
+        return field
+
+    def convert_temporal_rule_counts(self, rule: SigmaCorrelationRule) -> Tuple[str, str, str, List[str]]:
+        """Flag each referenced rule separately; case() would keep only the first rule an event matches."""
+        columns, flags = [], []
+        for i, reference in enumerate(rule.referenced_rules):
+            queries = [
+                self.convert_correlation_typing_query_postprocess(q)
+                for q in reference.rule.get_conversion_result()
+            ]
+            column = f"event_type_{i}"
+            columns.append(column)
+            match = queries[0] if len(queries) == 1 else " or ".join(f"({q})" for q in queries)
+            flags.append(f"{column}=case({match}, 1)")
+        typing = f"| eval {', '.join(flags)}"
+        aggregation = ", ".join(f"{c}=count({c})" for c in columns)
+        matched = " + ".join(f"case({c} > 0, 1, 0)" for c in columns)
+        return typing, aggregation, matched, columns
+
     def convert_window_correlation(
         self, rule: SigmaCorrelationRule, correlation_type: str
     ) -> str:
@@ -387,18 +450,28 @@ class ESQLBackend(TextQueryBackend):
                 "Percentile must be specified in condition for value_percentile correlation type",
             )
 
+        # A partial window can only undercount a count or sum, so the windows at the edges
+        # of a run are safe for gt/gte; anything else needs a complete window.
+        if correlation_type in WINDOW_UNSAFE_TYPES or (op and op.name not in ("GT", "GTE")):
+            return self.convert_trailing_correlation(rule, correlation_type, field, percentile)
+
         name, expression = CORRELATION_AGGREGATIONS[correlation_type]
-        aggregation = expression.format(field=field, percentile=percentile)
-        # Report the most extreme window: lowest for a ceiling, highest otherwise.
-        keep = "min" if op and op.name in ("LT", "LTE") else "max"
+        if correlation_type == "value_count":
+            field = self.correlation_value_field(field, cond.fieldref)
+        aggregation = f"{name}={expression.format(field=field, percentile=percentile)}"
+        typing, counted = None, []
+        if correlation_type == "temporal":
+            typing, aggregation, matched, _ = self.convert_temporal_rule_counts(rule)
+            counted = [f"| eval {name}={matched}"]
         condition = self.convert_correlation_condition_from_template(
             cond, rule.referenced_rules, correlation_type, "stats"
         )
         fields = self.convert_correlation_aggregation_fields_from_template(
             rule.fields, rule.referenced_rules, rule.group_by, "stats"
         )
-        groups = [self.escape_and_quote_field(f) for f in rule.group_by or []]
-        by = " by " + ", ".join(groups) if groups else ""
+        g = self.correlation_groups(rule)
+        groups = g["quoted"]
+        by = " by " + ", ".join(g["names"]) if groups else ""
 
         span = self.convert_timespan(rule.timespan)
         step = rule.timespan.seconds // 4
@@ -410,8 +483,8 @@ class ESQLBackend(TextQueryBackend):
         grid = f"mv_dedupe(mv_append(mv_append({grids[0]}, {grids[1]}), mv_append({grids[2]}, {grids[3]})))"
 
         parts = [self.convert_correlation_search(rule)]
-        if correlation_type == "temporal":
-            parts.append(self.convert_correlation_typing(rule))
+        if typing:
+            parts.append(typing)
         if groups:
             # ES|QL groups events missing a field as null
             present = " and ".join(f"{g} is not null" for g in groups)
@@ -421,13 +494,68 @@ class ESQLBackend(TextQueryBackend):
             "| where @timestamp is not null",
             f"| eval w = {grid}",
             "| mv_expand w",
-            f"| stats {name}={aggregation}, window_start=min(@timestamp), @timestamp=max(@timestamp),"
-            f" event.ingested=max(event.ingested){fields} by {', '.join(['w'] + groups)}",
+            f"| stats {aggregation}, window_start=min(@timestamp), @timestamp=max(@timestamp),"
+            f" event.ingested=max(event.ingested){fields}{g['first']} by {', '.join(['w'] + g['by'])}",
+            *counted,
             condition,
-            f"| stats {name}={keep}({name}), window_start=min(window_start), @timestamp=max(@timestamp),"
-            f" event.ingested=max(event.ingested){fields}{by}",
+            f"| stats {name}=max({name}), window_start=min(window_start), @timestamp=max(@timestamp),"
+            f" event.ingested=max(event.ingested){fields}{g['again']}{by}",
+            *([g["rename"]] if g["rename"] else []),
             # An ungrouped stats returns one empty row when nothing matched.
             "| where @timestamp is not null",
+            # Strongest groups first, so a row limit drops the weakest.
+            f"| sort {name} desc",
+        ]
+        return "\n".join(parts)
+
+    def convert_trailing_correlation(
+        self,
+        rule: SigmaCorrelationRule,
+        correlation_type: str,
+        field: Optional[str],
+        percentile: Optional[int],
+    ) -> str:
+        """Aggregate one event-time window of the timespan, ending far enough back that its events have arrived."""
+        name, expression = CORRELATION_AGGREGATIONS[correlation_type]
+        op = rule.condition.op.name if isinstance(rule.condition, SigmaCorrelationCondition) else None
+        if correlation_type == "value_count":
+            field = self.correlation_value_field(field, rule.condition.fieldref)
+        aggregation = f"{name}={expression.format(field=field, percentile=percentile)}"
+        typing, counted = None, []
+        if correlation_type == "temporal":
+            typing, aggregation, matched, columns = self.convert_temporal_rule_counts(rule)
+            counted = [f"| eval {name}={matched}", f"| drop {', '.join(columns)}"]
+        condition = self.convert_correlation_condition_from_template(
+            rule.condition, rule.referenced_rules, correlation_type, "stats"
+        )
+        fields = self.convert_correlation_aggregation_fields_from_template(
+            rule.fields, rule.referenced_rules, rule.group_by, "stats"
+        )
+        g = self.correlation_groups(rule)
+        groups = g["quoted"]
+        by = " by " + ", ".join(g["by"]) if groups else ""
+
+        # ElastAlert's search ends query_delay behind now and reaches correlation_allowance further
+        # back than the timespan; ending the window that much earlier counts events arriving that late.
+        end = self.query_delay + self.correlation_allowance
+        start = end + rule.timespan.seconds
+
+        parts = [self.convert_correlation_search(rule)]
+        if typing:
+            parts.append(typing)
+        if groups:
+            present = " and ".join(f"{g} is not null" for g in groups)
+            parts.append(f"| where {present}")
+        parts += [
+            f"| where @timestamp >= now() - {start} seconds and @timestamp < now() - {end} seconds",
+            f"| stats {aggregation}, window_start=min(@timestamp), @timestamp=max(@timestamp),"
+            f" event.ingested=max(event.ingested){fields}{g['first']}{by}",
+            *([g["rename"]] if g["rename"] else []),
+            *counted,
+            condition,
+            "| where @timestamp is not null",
+            # Groups furthest past the threshold first, so a row limit drops those nearest to it.
+            f"| sort {name} {'asc' if op in ('LT', 'LTE') else 'desc'}",
         ]
         return "\n".join(parts)
 
@@ -444,6 +572,8 @@ class ESQLBackend(TextQueryBackend):
         case_insensitive_exempt_fields: Optional[Iterable[str]] = None,
         multivalue_match_operator: Union[bool, str] = False,
         unmapped_fields: Optional[str] = None,
+        query_delay: Union[int, str] = 0,
+        correlation_allowance: Union[int, str] = 0,
         **kwargs,
     ):
         super().__init__(processing_pipeline, collect_errors, **kwargs)
@@ -459,6 +589,10 @@ class ESQLBackend(TextQueryBackend):
         # SET unmapped_fields (technical preview in ES 9.4): "nullify" reads fields that no queried index
         # maps as null instead of failing the query. Overrides the pipeline state key.
         self.unmapped_fields = _unmapped_fields_mode(unmapped_fields)
+        # Seconds ElastAlert's search ends behind now; trailing correlation windows end there.
+        self.query_delay = int(query_delay)
+        # Seconds late an event may arrive and still count in a trailing correlation window.
+        self.correlation_allowance = int(correlation_allowance)
         self._null_strict_depth = 0
         self.severity_risk_mapping = {
             "INFORMATIONAL": 1,

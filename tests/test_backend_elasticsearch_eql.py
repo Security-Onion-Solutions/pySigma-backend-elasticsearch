@@ -249,8 +249,26 @@ def test_eql_regex_query_escaped_input(eql_backend: EqlBackend):
         """
     )
     assert eql_backend.convert(rule) == [
-        r'any where fieldA regex~ "127\\.0\\.0\\.1:[1-9]\\d{3}" and fieldB:"foo" and fieldC regex~ "foo\/bar"'
+        r'any where fieldA regex~ "127\\.0\\.0\\.1:[1-9]\\d{3}" and fieldB:"foo" and fieldC regex~ "foo/bar"'
     ]
+
+
+def test_eql_regex_quote(eql_backend: EqlBackend):
+    """A quote in a regex is escaped so it does not end the EQL string."""
+    rule = SigmaCollection.from_yaml(
+        r"""
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|re: 'say "hi"'
+                condition: sel
+        """
+    )
+    assert eql_backend.convert(rule) == [r'any where fieldA regex~ "say \"hi\""']
 
 
 def test_eql_regex_escaped_dollar_sign(eql_backend: EqlBackend):
